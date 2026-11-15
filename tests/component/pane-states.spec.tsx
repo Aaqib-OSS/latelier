@@ -44,16 +44,19 @@ function Stateful({
   onRun,
   onClearFilter = noop,
   onQueryReplaced,
+  onInsert,
   meta,
 }: {
   initial: CollectionTabState;
   onRun?: (override?: Partial<CollectionTabState>) => void;
   onClearFilter?: () => void;
   onQueryReplaced?: () => void;
+  onInsert?: () => void;
   meta?: Partial<CollectionWorkspaceMeta>;
 }) {
   const [state, setState] = useState(initial);
   const actions = emptyWorkspaceActions({
+    ...(onInsert ? { openInsert: onInsert } : {}),
     patch: (p) => setState((s) => ({ ...s, ...p })),
     run: (override) => {
       onRun?.(override);
@@ -90,14 +93,18 @@ describe('one pane state for everything that is not rows', () => {
     expect(onClearFilter).toHaveBeenCalledTimes(1);
   });
 
-  it('an empty collection offers an import, and a view that takes no writes a re-run', () => {
-    const { unmount } = render(<Stateful initial={makeState({ lastRun: lastRun() })} />);
+  it('an empty collection offers Insert document and Import, and a view that takes no writes a re-run', async () => {
+    const onInsert = vi.fn();
+    const { unmount } = render(<Stateful initial={makeState({ lastRun: lastRun() })} onInsert={onInsert} />);
     expect(screen.getByTestId('pane-state').textContent).toContain('This collection is empty');
-    expect(screen.getByRole('button', { name: /import documents/i })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Import…' })).toBeTruthy();
+    await userEvent.click(screen.getByRole('button', { name: 'Insert document' }));
+    expect(onInsert).toHaveBeenCalledOnce();
     unmount();
 
     render(<Stateful initial={makeState({ lastRun: lastRun() })} meta={{ isView: true }} />);
-    expect(screen.queryByRole('button', { name: /import documents/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Import…' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Insert document' })).toBeNull();
     expect(screen.getByRole('button', { name: 'Run again' })).toBeTruthy();
   });
 
@@ -136,6 +143,39 @@ describe('a query the server refused', () => {
 
     expect(screen.getByRole('alert').textContent).toContain(`${REFUSED.code}: ${REFUSED.message}`);
     expect(screen.queryByText('recovered')).toBeNull();
+  });
+
+  it('says the message first and keeps the code under Details, closed', () => {
+    render(<Stateful initial={failing()} />);
+
+    const alert = screen.getByRole('alert');
+    const details = screen.getByText('Details').closest('details')!;
+    expect(details.open).toBe(false);
+    expect(alert.contains(details)).toBe(true);
+    // Outside Details the message stands alone, with no code in front of it.
+    const said = screen.getByText(REFUSED.message);
+    expect(details.contains(said)).toBe(false);
+    expect(said.compareDocumentPosition(details) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(alert.textContent!.replace(details.textContent!, '')).not.toContain(REFUSED.code);
+    expect(screen.getByTestId('error-details').textContent).toBe(`${REFUSED.code}: ${REFUSED.message}`);
+  });
+
+  it.each([
+    ['a mistyped operator', { code: 'MONGO_OP', message: 'unknown operator: $gte1' }, 'Did you mean $gte?'],
+    ['a refused connection', { code: 'NETWORK', message: 'connect ECONNREFUSED 127.0.0.1:27017' }, 'The server is not reachable.'],
+    [
+      'a socket that timed out',
+      { code: 'NETWORK', message: 'connection 3 to db:27017 timed out' },
+      "Raise Socket timeout in the connection's Advanced tab.",
+    ],
+  ])('adds what to do about %s', (_what, error, hint) => {
+    render(<Stateful initial={failing({ lastRun: lastRun({ error }) })} />);
+    expect(screen.getByTestId('error-hint').textContent).toBe(hint);
+  });
+
+  it('adds nothing when the message is all there is to say', () => {
+    render(<Stateful initial={failing()} />);
+    expect(screen.queryByTestId('error-hint')).toBeNull();
   });
 
   it('Revert restores the last valid query, runs it, and reports the wholesale load', async () => {
@@ -213,10 +253,11 @@ describe('the fixed band', () => {
     expect(band.style.height).toBe('31px');
   });
 
-  it('says a re-run is running and offers Cancel', async () => {
+  it('marks the rows as the previous results while a re-run is running, and offers Cancel', async () => {
     const { band, cancel } = renderBand(withRows, { isLoading: true });
     expect(band.style.height).toBe('31px');
-    expect(screen.getByRole('status').textContent).toBe('Running…');
+    // "Running" and how long are the status bar's to say.
+    expect(screen.getByRole('status').textContent).toBe('Previous results');
 
     await userEvent.click(screen.getByRole('button', { name: 'Cancel' }));
     expect(cancel).toHaveBeenCalledTimes(1);

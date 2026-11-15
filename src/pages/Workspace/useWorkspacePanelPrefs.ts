@@ -23,6 +23,8 @@ export function useWorkspacePanelPrefs(): {
   setRefDrawerWidth: React.Dispatch<React.SetStateAction<number>>;
   commitRefDrawerWidth: (v: number) => void;
   innerHSplit: number;
+  /** A split was chosen (stored or dragged); until then the Inspector opens at its default pixel width. */
+  innerHSplitStored: boolean;
   commitInnerHSplit: (v: number) => void;
   shellSplit: number;
   commitShellSplit: (v: number) => void;
@@ -33,15 +35,18 @@ export function useWorkspacePanelPrefs(): {
   /** Below the width that fits both side panels. Layout changes here are not the user's stored layout. */
   onePanelOnly: boolean;
 } {
-  const [leftWidth, setLeftWidth] = React.useState(206);
+  const [leftWidth, setLeftWidth] = React.useState(240);
   // Pixels, not a percentage: a plain flex column resized via the bespoke ResizeHandle, not a react-resizable-panels Panel.
   const [refDrawerWidth, setRefDrawerWidth] = React.useState(380);
   const [innerHSplit, setInnerHSplit] = React.useState(BUILDER_DEFAULT_PCT);
+  const [innerHSplitStored, setInnerHSplitStored] = React.useState(false);
   const [shellSplit, setShellSplit] = React.useState(25);
   // Panels render with default sizes immediately; the key flip on ready re-mounts with persisted sizes, avoiding a layout shift.
   const [prefsReady, setPrefsReady] = React.useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = React.useState(false);
-  const [builderCollapsed, setBuilderCollapsed] = React.useState(false);
+  // W15 §16: closed unless a stored choice says otherwise. Open, it spent a
+  // fifth of the width on an empty state for a profile that never asked for it.
+  const [builderCollapsed, setBuilderCollapsed] = React.useState(true);
 
   React.useEffect(() => {
     let active = true;
@@ -58,7 +63,10 @@ export function useWorkspacePanelPrefs(): {
         if (!active) return;
         if (typeof l === 'number') setLeftWidth(l);
         if (typeof rdw === 'number') setRefDrawerWidth(rdw);
-        if (typeof ihs === 'number') setInnerHSplit(ihs);
+        if (typeof ihs === 'number') {
+          setInnerHSplit(ihs);
+          setInnerHSplitStored(true);
+        }
         if (typeof ss === 'number') setShellSplit(ss);
         if (typeof collapsed === 'boolean') setSidebarCollapsed(collapsed);
         if (typeof builderC === 'boolean') setBuilderCollapsed(builderC);
@@ -108,6 +116,7 @@ export function useWorkspacePanelPrefs(): {
 
   const commitInnerHSplit = React.useCallback((v: number) => {
     setInnerHSplit(v);
+    setInnerHSplitStored(true);
     persistPref('ui.workspace.innerHSplit', v);
   }, []);
 
@@ -132,6 +141,7 @@ export function useWorkspacePanelPrefs(): {
     setRefDrawerWidth,
     commitRefDrawerWidth,
     innerHSplit,
+    innerHSplitStored,
     commitInnerHSplit,
     shellSplit,
     commitShellSplit,

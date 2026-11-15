@@ -2,6 +2,7 @@ import React from 'react';
 import { notify } from '../../theme/notifications';
 import { invalidateSampleSchemaCache } from '../../features/fieldSuggestions/sources/sampleSchemaSource';
 import { offerUndo } from './offerUndo';
+import { forgetUndo, type UndoTarget } from './undoStore';
 import { filterProblem } from './builder';
 import { stripIdForDuplicate } from './views/docId';
 import type { CollectionTab } from '@shared/types';
@@ -30,12 +31,14 @@ export function useDocumentDialogs(deps: {
   activeTabId: string | null;
   /** Resolves a tab's current runner target at write-completion time; `null` if the tab is gone. */
   resolveRunnerTarget: (tabId: string) => RunnerTarget | null;
+  /** Every open tab on a collection, for the refresh after an undo, which any of them can run. */
+  resolveNamespaceTargets: (ns: UndoTarget) => RunnerTarget[];
   /** The Focused Tab's Connection is read-only, so the Document Editor never opens. */
   readOnly: boolean;
   /** The Focused Tab is a view: it has no writes, and Edit opens the read-only dialog. */
   isView: boolean;
 }): {
-  editing: { doc: unknown; target: DocTarget; focusPath?: string } | null;
+  editing: { doc: unknown; target: DocTarget; focusPath?: string; siblings?: readonly unknown[] } | null;
   viewing: { doc: unknown; target: DocTarget } | null;
   closeViewer: () => void;
   deleteDoc: unknown | null;
@@ -69,12 +72,12 @@ export function useDocumentDialogs(deps: {
    * page). */
   writeVersion: number;
 } {
-  const { activeCollectionRef, activeTabId, resolveRunnerTarget, readOnly, isView } = deps;
+  const { activeCollectionRef, activeTabId, resolveRunnerTarget, resolveNamespaceTargets, readOnly, isView } = deps;
   const { run } = deps.queryRunner;
 
   // Target travels inside editing/inserting with the payload, captured at
   // open time, so a tab switch mid-edit can't retarget the eventual write.
-  const [editing, setEditing] = React.useState<{ doc: unknown; target: DocTarget; focusPath?: string } | null>(null);
+  const [editing, setEditing] = React.useState<{ doc: unknown; target: DocTarget; focusPath?: string; siblings?: readonly unknown[] } | null>(null);
   const [viewing, setViewing] = React.useState<{ doc: unknown; target: DocTarget } | null>(null);
   const [deleteDoc, setDeleteDocState] = React.useState<unknown | null>(null);
   // A view has no deletes; the guard sits here so no caller has to remember it.
@@ -117,7 +120,9 @@ export function useDocumentDialogs(deps: {
         });
         return;
       }
-      setEditing({ doc, target: targetOf(a), focusPath });
+      // The result the document was opened from, for the editor's ‹ ›: a
+      // snapshot, so a re-run behind the dialog cannot reorder it mid-walk.
+      setEditing({ doc, target: targetOf(a), focusPath, siblings: a.state.lastRun?.documents });
     },
     [activeCollectionRef, readOnly, isView],
   );
@@ -181,14 +186,31 @@ export function useDocumentDialogs(deps: {
     [rerunTarget],
   );
 
+  // An undo is keyed by collection, not by the tab that wrote, and ⌘Z runs it
+  // from any tab on that collection: every one of them re-runs, the writing
+  // tab included while it is still open.
+  const refreshAfterUndo = React.useCallback(
+    (target: DocTarget) => {
+      invalidateSampleSchemaCache(target.connectionId, target.dbName, target.collection);
+      for (const t of resolveNamespaceTargets(target)) void run(undefined, t);
+      setWriteVersion((v) => v + 1);
+    },
+    [resolveNamespaceTargets, run],
+  );
+
+  // Inserts record nothing to undo, so they drop the collection's older undo.
   const closeInsertDrawer = React.useCallback(() => setInserting(null), []);
   const handleInserted = React.useCallback(() => {
     const target = inserting?.target;
     closeInsertDrawer();
-    if (target) refreshSource(target);
+    if (!target) return;
+    forgetUndo(target);
+    refreshSource(target);
   }, [closeInsertDrawer, inserting, refreshSource]);
   const handlePartialInsert = React.useCallback(() => {
-    if (inserting) refreshSource(inserting.target);
+    if (!inserting) return;
+    forgetUndo(inserting.target);
+    refreshSource(inserting.target);
   }, [inserting, refreshSource]);
 
   const closeEditor = React.useCallback(() => setEditing(null), []);
@@ -198,8 +220,8 @@ export function useDocumentDialogs(deps: {
     setEditing(null);
     if (!target) return;
     refreshSource(target);
-    offerUndo('Document updated', auditId, () => refreshSource(target));
-  }, [editing, refreshSource]);
+    offerUndo('Document updated', auditId, () => refreshAfterUndo(target), target);
+  }, [editing, refreshAfterUndo, refreshSource]);
 
   const closeDeleteDialogs = React.useCallback(() => {
     setDeleteDocState(null);
@@ -225,11 +247,12 @@ export function useDocumentDialogs(deps: {
     // delete-all over the bulk capture ceiling still needs to say what
     // happened.
     if (auditId === undefined) {
+      forgetUndo(target);
       notify.success(message);
       return;
     }
-    offerUndo(message, auditId, () => refreshSource(target));
-  }, [activeCollectionRef, closeDeleteDialogs, refreshSource, rerunTarget]);
+    offerUndo(message, auditId, () => refreshAfterUndo(target), target);
+  }, [activeCollectionRef, closeDeleteDialogs, refreshAfterUndo, rerunTarget]);
 
   // Same shape as delete-all: UpdateConfirm also reports the collection it
   // wrote to, drops the field-suggestion sample itself and closes itself, and
@@ -241,11 +264,12 @@ export function useDocumentDialogs(deps: {
     // Exactly one toast: Undo-bearing when reversible, plain otherwise — an
     // update over the bulk capture ceiling still needs to say what happened.
     if (auditId === undefined) {
+      forgetUndo(target);
       notify.success(message);
       return;
     }
-    offerUndo(message, auditId, () => refreshSource(target));
-  }, [activeCollectionRef, closeUpdateAllModal, refreshSource, rerunTarget]);
+    offerUndo(message, auditId, () => refreshAfterUndo(target), target);
+  }, [activeCollectionRef, closeUpdateAllModal, refreshAfterUndo, rerunTarget]);
 
   // DeleteConfirm's and UpdateConfirm's targets are read live from the
   // Focused Tab, so any route that moves focus off the tab either was opened

@@ -6,12 +6,14 @@ import { getErrorMessage } from '../../api/atelier';
 import { notify } from '../../theme/notifications';
 import type { WorkspaceTab, ConnectionSummary } from '@shared/types';
 import type { WorkspaceTabsState } from '../../state/workspaceTabs';
-import { ConnectionSwitcher, type ConnectionSwitcherProps } from '../../features/connections/ConnectionSwitcher';
+import type { ConnectionSwitcherProps } from '../../features/connections/ConnectionSwitcher';
 import { TitleBar } from './TitleBar';
+import { LocationBreadcrumb } from './LocationBreadcrumb';
+import { locationModel } from './locationModel';
 import { TabStrip } from './TabStrip';
+import { reopenClosedTab } from './reopenClosedTab';
 import { activateTab, closeTabGuarded } from './tabActions';
 import { ResizeHandle } from './ResizeHandle';
-import { DividerNotch } from './DividerNotch';
 import {
   DbCollectionNavigator,
   type NavigatorDialogRequest,
@@ -27,8 +29,6 @@ import type { NavigatorData } from './useNavigatorData';
 
 // Returns a fragment: AppShell places .Header/.Navbar/.Main by CSS grid on direct children, so a wrapper here would break layout.
 export interface ShellSectionProps {
-  dark: boolean;
-  toggle: () => void;
   focusedConnection: ConnectionSummary | null;
   switcherProps: Omit<ConnectionSwitcherProps, 'variant'>;
   settings: ReturnType<typeof useSettings>;
@@ -37,9 +37,13 @@ export interface ShellSectionProps {
   setShellOpen: React.Dispatch<React.SetStateAction<boolean>>;
   tabs: WorkspaceTabsState;
   connections: ConnectionSummary[];
+  /** True until the first Connections list arrives: an empty list then is not "none saved". */
+  connectionsLoading: boolean;
   connectionsWithTabs: Set<string>;
   active: WorkspaceTab | null;
   scratchConnectionId: string | null;
+  /** The §8 "Open collection" picker, from the strip's `+ ▾`. */
+  onOpenCollectionPicker: () => void;
   hints: ReturnType<typeof useHints>;
   openConnection: (id: string) => void;
   panelPrefs: ReturnType<typeof useWorkspacePanelPrefs>;
@@ -60,8 +64,6 @@ export interface ShellSectionProps {
 }
 
 export function ShellSection({
-  dark,
-  toggle,
   focusedConnection,
   switcherProps,
   settings,
@@ -70,9 +72,11 @@ export function ShellSection({
   setShellOpen,
   tabs,
   connections,
+  connectionsLoading,
   connectionsWithTabs,
   active,
   scratchConnectionId,
+  onOpenCollectionPicker,
   hints,
   openConnection,
   panelPrefs,
@@ -155,6 +159,29 @@ export function ShellSection({
     setNavigatorRevealRequest({ connectionId: t.connectionId, dbName: t.dbName, collection: t.collection });
   };
 
+  const location = locationModel(active, connections);
+  const openCollections = React.useMemo(() => tabs.tabs.filter((t) => t.kind === 'collection'), [tabs.tabs]);
+  const titleBarProps = {
+    sidebarCollapsed,
+    onToggleSidebar: toggleSidebar,
+    onOpenSettings: () => settings.open(),
+    onOpenPalette: palette.toggle,
+    shellOpen,
+    shellAvailable: !!focusedConnection,
+    onToggleShell: () => setShellOpen((v) => !v),
+  };
+
+  // Nothing saved: the welcome canvas fills the window (C03 §13.1). The title
+  // bar keeps the search field and Settings; there is no breadcrumb, tab strip
+  // or navigator around nothing.
+  if (!connectionsLoading && connections.length === 0) {
+    return (
+      <AppShell.Header withBorder={false} style={{ background: 'transparent' }}>
+        <TitleBar bare {...titleBarProps} />
+      </AppShell.Header>
+    );
+  }
+
   return (
     <>
       <AppShell.Header
@@ -162,24 +189,44 @@ export function ShellSection({
         style={{ display: 'flex', flexDirection: 'column', background: 'transparent' }}
       >
         <TitleBar
-          dark={dark}
-          toggle={toggle}
-          connectionName={focusedConnection?.name ?? null}
-          connectionSlot={<ConnectionSwitcher {...switcherProps} />}
-          onOpenSettings={() => settings.open()}
-          onOpenPalette={palette.toggle}
-          shellOpen={shellOpen}
-          shellAvailable={!!focusedConnection}
-          onToggleShell={() => setShellOpen((v) => !v)}
+          breadcrumb={
+            // No breadcrumb until the first list arrives, or with no Connection to name.
+            location && (
+              <LocationBreadcrumb
+                model={location}
+                active={active}
+                switcherProps={switcherProps}
+                caches={navigatorData.tree.caches}
+                loadDbs={(id) => void navigatorData.loadDbs(id)}
+                loadColls={(id, db) => void navigatorData.loadColls(id, db)}
+                onOpenCollection={(input, { newTab }) =>
+                  void tabs.openCollection({ ...input, reuseExisting: !newTab })
+                }
+                onChooseCollection={palette.openCollections}
+              />
+            )
+          }
+          {...titleBarProps}
         />
         <TabStrip
           tabs={tabs.tabs}
           connections={connections}
           activeId={tabs.activeId}
+          previewId={tabs.previewId}
+          onKeep={tabs.keepTab}
+          onOpenCollectionPicker={onOpenCollectionPicker}
+          onNewAggregation={(id) => {
+            const t = tabs.tabs.find((x) => x.id === id);
+            if (t?.kind === 'collection') {
+              void tabs.openAggregation({ connectionId: t.connectionId, dbName: t.dbName, collection: t.collection });
+            }
+          }}
           onOpenNewScript={() => {
             if (!scratchConnectionId) return;
             void tabs.openScript({ connectionId: scratchConnectionId });
           }}
+          canReopen={tabs.closedCount > 0}
+          onReopen={() => void reopenClosedTab(tabs, connections, connectionsLoading)}
           onActivate={activate}
           onClose={(id) => void closeTabGuarded(tabs, id)}
           onReorder={(ids) => void tabs.reorder(ids)}
@@ -203,7 +250,7 @@ export function ShellSection({
             flexDirection: 'column',
             overflow: 'visible',
             background: T.surface,
-            borderRight: `1px solid ${T.border}`,
+            borderRight: sidebarCollapsed ? 'none' : `1px solid ${T.border}`,
           }}
         >
           {!sidebarCollapsed && (
@@ -215,13 +262,16 @@ export function ShellSection({
                 activeDbName={active?.dbName ?? null}
                 activeCollection={active?.collection ?? null}
                 onOpenCollection={(input: NavigatorOpenInput, opts) =>
-                  void tabs.openCollection({ ...input, reuseExisting: opts.reuseExisting })
+                  void tabs.openCollection({ ...input, reuseExisting: opts.reuseExisting, preview: opts.preview })
                 }
                 onOpenAggregation={(input: NavigatorOpenInput) =>
                   void tabs.openAggregation(input)
                 }
                 onEditConnection={openEditConnectionModal}
                 onDisconnect={requestDisconnect}
+                openCollections={openCollections}
+                onOpenServer={switcherProps.onManage}
+                onAddConnection={switcherProps.onAdd}
                 onCollectionDropped={(connectionId, dbName, collection) => {
                   void tabs.closeForNamespace({ connectionId, dbName, collection });
                 }}
@@ -266,12 +316,6 @@ export function ShellSection({
               </div>
             </>
           )}
-          <DividerNotch
-            side="right"
-            collapsed={sidebarCollapsed}
-            onClick={toggleSidebar}
-            ariaLabel={sidebarCollapsed ? 'Open navigator' : 'Collapse navigator'}
-          />
         </div>
       </AppShell.Navbar>
     </>

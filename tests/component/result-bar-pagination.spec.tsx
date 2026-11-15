@@ -3,6 +3,7 @@ import { notifications } from '@mantine/notifications';
 import { render, screen, fireEvent, waitFor, emptyWorkspaceActions, emptyWorkspaceMeta } from '../helpers/render';
 import { installAtelierMock, uninstallAtelierMock } from '../helpers/atelierMock';
 import { ResultBar } from '../../src/pages/Workspace/ResultBar';
+import { StatusBar } from '../../src/pages/Workspace/StatusBar';
 import { CollectionWorkspaceProvider } from '../../src/pages/Workspace/CollectionWorkspaceProvider';
 import type { CollectionTabState } from '@shared/types';
 
@@ -53,6 +54,7 @@ function renderBar(overrides: BarStateOverride = {}) {
         actions={actions}
         meta={meta}
       >
+        <StatusBar connection={null} />
         <ResultBar />
       </CollectionWorkspaceProvider>
   );
@@ -60,9 +62,33 @@ function renderBar(overrides: BarStateOverride = {}) {
 }
 
 describe('ResultBar - page label', () => {
-  it('reserves room for the widest page this count reaches, so Next and Last hold still', () => {
+  it('reserves room for the widest range this total reaches, so Next and Last hold still', () => {
     renderBar({ page: 0, pageSize: 50, totalCount: 120_000, docCount: 50 });
-    expect(screen.getByTestId('page-label').style.minWidth).toBe('max(48px, 11ch)');
+    expect(screen.getByTestId('page-label').style.minWidth).toBe('169px');
+  });
+
+  it.each([
+    [{ page: 0, pageSize: 50, totalCount: 60, docCount: 50 }, '1–50 of 60'],
+    [{ page: 1, pageSize: 50, totalCount: 60, docCount: 10 }, '51–60 of 60'],
+    [{ page: 0, pageSize: 50, totalCount: 0, docCount: 0 }, '0 of 0'],
+    [{ page: 0, pageSize: 50, docCount: 50, hasMore: true }, '1–50'],
+    // Empty with no count back: nothing matched, so the total is known.
+    [{ page: 0, pageSize: 50, docCount: 0 }, '0 of 0'],
+  ])('reads %j as "%s"', (props, text) => {
+    renderBar(props);
+    expect(screen.getByTestId('page-label').textContent).toBe(text);
+  });
+});
+
+describe('ResultBar - uncounted total', () => {
+  it('counts "50+" on the first page and the range end on a later one', () => {
+    renderBar({ page: 0, pageSize: 50, docCount: 50, hasMore: true });
+    expect(screen.getByTestId('result-count-slot').textContent).toContain('50+ documents');
+  });
+
+  it('uses the range end, not this page\'s own count, as the lower bound', () => {
+    renderBar({ page: 2, pageSize: 50, docCount: 50, hasMore: true });
+    expect(screen.getByTestId('result-count-slot').textContent).toContain('150+ documents');
   });
 });
 
@@ -82,10 +108,10 @@ describe('ResultBar - pagination canNext', () => {
       durationMs: 5,
     });
     const nextBtn = screen.getByLabelText('Next page') as HTMLButtonElement;
-    expect(nextBtn.disabled).toBe(true);
+    expect(nextBtn.getAttribute('aria-disabled')).toBe('true');
 
     const lastBtn = screen.getByLabelText('Last page') as HTMLButtonElement;
-    expect(lastBtn.disabled).toBe(true);
+    expect(lastBtn.getAttribute('aria-disabled')).toBe('true');
   });
 
   it('enables Next when page < totalPages - 1', () => {
@@ -98,7 +124,7 @@ describe('ResultBar - pagination canNext', () => {
       durationMs: 5,
     });
     const nextBtn = screen.getByLabelText('Next page') as HTMLButtonElement;
-    expect(nextBtn.disabled).toBe(false);
+    expect(nextBtn.getAttribute('aria-disabled')).toBeNull();
     fireEvent.click(nextBtn);
     expect(actions.patch).toHaveBeenCalledWith({ page: 11 });
     expect(actions.run).toHaveBeenCalledWith({ page: 11 });
@@ -114,7 +140,7 @@ describe('ResultBar - pagination canNext', () => {
       durationMs: 5,
     });
     const nextBtn = screen.getByLabelText('Next page') as HTMLButtonElement;
-    expect(nextBtn.disabled).toBe(false);
+    expect(nextBtn.getAttribute('aria-disabled')).toBeNull();
   });
 
   it('disables Next when totalCount is in flight and hasMore is false', () => {
@@ -127,7 +153,7 @@ describe('ResultBar - pagination canNext', () => {
       durationMs: 5,
     });
     const nextBtn = screen.getByLabelText('Next page') as HTMLButtonElement;
-    expect(nextBtn.disabled).toBe(true);
+    expect(nextBtn.getAttribute('aria-disabled')).toBe('true');
   });
 
   it('Last page button jumps to the final page', () => {
@@ -140,7 +166,7 @@ describe('ResultBar - pagination canNext', () => {
       durationMs: 5,
     });
     const lastBtn = screen.getByLabelText('Last page') as HTMLButtonElement;
-    expect(lastBtn.disabled).toBe(false);
+    expect(lastBtn.getAttribute('aria-disabled')).toBeNull();
     fireEvent.click(lastBtn);
     expect(actions.patch).toHaveBeenCalledWith({ page: 25 });
     expect(actions.run).toHaveBeenCalledWith({ page: 25 });
@@ -156,7 +182,7 @@ describe('ResultBar - pagination canNext', () => {
       durationMs: 5,
     });
     const firstBtn = screen.getByLabelText('First page') as HTMLButtonElement;
-    expect(firstBtn.disabled).toBe(false);
+    expect(firstBtn.getAttribute('aria-disabled')).toBeNull();
     fireEvent.click(firstBtn);
     expect(actions.patch).toHaveBeenCalledWith({ page: 0 });
     expect(actions.run).toHaveBeenCalledWith({ page: 0 });
@@ -272,12 +298,17 @@ describe('ResultBar - the limit that caps the results is visible beside the coun
 
   it('names an empty page instead of showing the range "1–0"', () => {
     renderBar({ page: 0, pageSize: 50, totalCount: 0, docCount: 0, durationMs: 5 });
-    expect(screen.queryByText(/showing/)).toBeNull();
-    expect(screen.getByText('nothing to show')).toBeTruthy();
+    const text = screen.getByTestId('result-count-slot').textContent;
+    expect(text).toBe('0 documents · 5 ms');
+  });
+
+  it('says "1 document" in the singular', () => {
+    renderBar({ page: 0, pageSize: 50, totalCount: 1, docCount: 1, durationMs: 5 });
+    expect(screen.getByTestId('result-count-slot').textContent).toBe('1 document · 5 ms');
   });
 
   it('still shows the range for a page that has documents', () => {
     renderBar({ page: 0, pageSize: 50, totalCount: 3, docCount: 3, durationMs: 5 });
-    expect(screen.getByText('showing 1–3')).toBeTruthy();
+    expect(screen.getByText(/1–3 of 3/)).toBeTruthy();
   });
 });

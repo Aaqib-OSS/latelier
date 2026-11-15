@@ -1,4 +1,5 @@
 import { parseExpressionAt, type AnyNode, type Expression } from 'acorn';
+import { isEjsonDocument } from './ejson';
 
 /**
  * Shell Syntax → Canonical EJSON, as a *text* transform.
@@ -184,6 +185,28 @@ export function repairOnCommit(
   return { text, outcome };
 }
 
+export interface LiveValidity {
+  /** The text as the transform would leave it; the text as typed when it refuses. */
+  text: string;
+  /** Valid Shell Syntax that is not Canonical EJSON yet. */
+  repaired: boolean;
+  /** A document the transform accepts, so a Run would send it. */
+  runnable: boolean;
+}
+
+/**
+ * X14 §11 — what a check that runs while the user types judges: the text as
+ * the transform would leave it, not the uncommitted text itself. Judging the
+ * latter called `{status: 'shipped'}` invalid although ⌘↵ then ran it.
+ */
+export function liveValidity(text: string): LiveValidity {
+  const outcome = repairToCanonicalEjson(text);
+  // Text the transform refuses is never JSON, so it falls out as not runnable.
+  const repaired = outcome.kind === 'repaired';
+  const live = repaired ? outcome.text : text;
+  return { text: live, repaired, runnable: isEjsonDocument(live) };
+}
+
 /**
  * X14 §5 (T5) — a `failed` outcome as one line of user-facing text.
  *
@@ -211,6 +234,21 @@ export function refusalMessage(text: string, outcome: RepairOutcome): string | n
   return `Line ${line}, column ${column}: ${outcome.reason}`;
 }
 
+/**
+ * W05 §9.3 — the span of `text` a `failed` outcome points at, for the editor to
+ * underline: from `index` to the end of the token there. A punctuation
+ * character is its own one-character token, and an index at the end of the
+ * text (an unterminated value) is drawn on the last character instead.
+ */
+export function refusalRange(text: string, outcome: RepairOutcome): { start: number; end: number } | null {
+  if (outcome.kind !== 'failed' || outcome.index === undefined || text.trim() === '') return null;
+  let start = Math.min(outcome.index, text.trimEnd().length - 1);
+  // The parser can point at the gap before the token (`{a: 1} junk` points at the space).
+  while (/\s/.test(text.charAt(start))) start++;
+  const word = /^[^\s,:{}[\]()]+/.exec(text.slice(start));
+  return { start, end: start + (word ? word[0].length : 1) };
+}
+
 function walk(node: AnyNode, text: string, edits: Edit[]): void {
   switch (node.type) {
     case 'ObjectExpression': {
@@ -218,13 +256,26 @@ function walk(node: AnyNode, text: string, edits: Edit[]): void {
         if (prop.type !== 'Property') {
           throw new UnsupportedSyntax('A spread element is not supported here.', prop.start);
         }
-        if (prop.computed || prop.kind !== 'init' || prop.method) {
+        // `["__proto__"]` is how mongosh spells that field (a plain `__proto__:`
+        // sets the prototype), and the Copy formats emit it. Only a quoted string
+        // literal is accepted inside the brackets, so no expression is evaluated.
+        const computedKey = prop.computed && prop.key.type === 'Literal' && typeof prop.key.value === 'string';
+        if ((prop.computed && !computedKey) || prop.kind !== 'init' || prop.method) {
           throw new UnsupportedSyntax('This is not a plain field and value.', prop.start);
         }
         if (prop.shorthand) {
           throw new UnsupportedSyntax('A field must have a value.', prop.start);
         }
-        edits.push({ start: prop.key.start, end: prop.key.end, replacement: keyText(prop.key, text) });
+        if (computedKey) {
+          // Replace the brackets with the key: `[ "a" ]` → `"a"`.
+          const close = text.indexOf(']', prop.key.end);
+          if (!/^\s*$/.test(text.slice(prop.key.end, close))) {
+            throw new UnsupportedSyntax('This is not a plain field and value.', prop.start);
+          }
+          edits.push({ start: prop.start, end: close + 1, replacement: keyText(prop.key, text) });
+        } else {
+          edits.push({ start: prop.key.start, end: prop.key.end, replacement: keyText(prop.key, text) });
+        }
         walk(prop.value as AnyNode, text, edits);
       }
       if (node.properties.length > 0) {

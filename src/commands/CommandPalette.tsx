@@ -74,6 +74,8 @@ export function _resetPaletteStoreForTests(): void {
 
 interface PaletteApi {
   open: () => void;
+  /** Opens on the Collections scope, as ⌘P does. */
+  openCollections: () => void;
   close: () => void;
   toggle: () => void;
   isOpen: () => boolean;
@@ -85,6 +87,7 @@ const ApiRefCtx = React.createContext<ApiRef | null>(null);
 
 const NOOP_API: PaletteApi = {
   open: () => {},
+  openCollections: () => {},
   close: () => {},
   toggle: () => {},
   isOpen: () => false,
@@ -102,6 +105,7 @@ export function usePaletteApi(): PaletteApi {
   return React.useMemo<PaletteApi>(
     () => ({
       open: () => ref?.current?.open() ?? NOOP_API.open(),
+      openCollections: () => ref?.current?.openCollections() ?? NOOP_API.openCollections(),
       close: () => ref?.current?.close() ?? NOOP_API.close(),
       toggle: () => ref?.current?.toggle() ?? NOOP_API.toggle(),
       isOpen: () => ref?.current?.isOpen() ?? false,
@@ -184,9 +188,10 @@ const KIND_ICON: Record<RowKind, React.ReactNode> = {
       <path d="M6 3h12v18l-6-4-6 4z" />
     </Svg>
   ),
+  // A command glyph, never a chevron: a chevron on the left reads as "expandable" (X07 §14.4).
   action: (
     <Svg>
-      <path d="M9 18l6-6-6-6" />
+      <path d="M13 2L4 14h7l-1 8 9-12h-7z" />
     </Svg>
   ),
 };
@@ -670,7 +675,7 @@ function PaletteContent({ onClose, recentIds, recordRecent, initialScope, histor
 
   // A new query or scope is a new list: the cursor goes back to the top.
   const listKey = `${scope}\u0000${narrowed}\u0000${query}`;
-  const { index: safeCursor, setIndex, move } = useRovingHighlight(entries.length, listKey);
+  const { index: safeCursor, setIndex, move } = useRovingHighlight(entries.length, listKey, layout.initialCursor);
 
   const actionsOf = React.useMemo(
     () => (actionsOfId === null ? null : (all.find((c) => c.id === actionsOfId)?.object ?? null)),
@@ -721,16 +726,20 @@ function PaletteContent({ onClose, recentIds, recordRecent, initialScope, histor
       followRef.current = null;
       return;
     }
-    const at = entries.findIndex((e) => e.type === 'row' && e.id === follow.id);
+    const at = entries.findIndex((e) => e.id === follow.id);
     if (at !== -1 && at !== safeCursor) setIndex(at);
   }, [entries, safeCursor, setIndex, listKey]);
+  // A cursor the user put on a row stays on that row when the list changes
+  // under it (the collections group arriving above the rest, a toggle moving
+  // its row), by the row's id.
   const setCursor = (index: number) => {
-    followRef.current = null;
+    const id = entries[index]?.id;
+    followRef.current = id === undefined ? null : { id, listKey };
     setIndex(index);
   };
   const moveCursor = (delta: number) => {
-    followRef.current = null;
-    move(delta);
+    const id = entries[move(delta)]?.id;
+    followRef.current = id === undefined ? null : { id, listKey };
   };
   const switchScope = (next: Scope) => {
     followRef.current = null;
@@ -751,7 +760,10 @@ function PaletteContent({ onClose, recentIds, recordRecent, initialScope, histor
   }, [recordRecentRef]);
 
   const inputRef = React.useRef<HTMLInputElement>(null);
-  // The last query comes back selected, so typing replaces it.
+  // The last query comes back selected, so typing replaces it. Until the user
+  // edits it, every focus selects it again: the modal moves focus in after
+  // mount, and that focus can drop the selection, leaving the caret at the start.
+  const editedRef = React.useRef(false);
   React.useEffect(() => {
     inputRef.current?.select();
   }, []);
@@ -992,7 +1004,11 @@ function PaletteContent({ onClose, recentIds, recordRecent, initialScope, histor
   };
 
   const onlyFromQuery = entries.length > 0 && entries.every((e) => e.type === 'row' && e.row.fromQuery);
-  const emptyText = typed
+  // A sweep that could still produce a match is no reason to say "No matches" yet (X07 §14.5).
+  const loadingCollections = ctx.collectionsPending === true && (typed || scope === 'collections');
+  const emptyText = loadingCollections
+    ? 'Loading collections…'
+    : typed
     ? `No matches for "${query.trim()}"`
     : scope === 'all'
       ? 'No actions available here yet.'
@@ -1056,9 +1072,13 @@ function PaletteContent({ onClose, recentIds, recordRecent, initialScope, histor
       <input
         ref={inputRef}
         data-autofocus
+        onFocus={(e) => {
+          if (!editedRef.current) e.currentTarget.select();
+        }}
         className="atelier-palette-input"
         value={inStep ? stepQuery : inActions ? actionQuery : query}
         onChange={(e) => {
+          editedRef.current = true;
           const v = e.currentTarget.value;
           if (inStep) setStepQuery(v);
           else if (inActions) setActionQuery(v);
@@ -1280,6 +1300,22 @@ function PaletteContent({ onClose, recentIds, recordRecent, initialScope, histor
           {line.after}
         </div>
       )}
+      {/* Mounted before its text arrives, so the change is announced; hidden while it has none. */}
+      <div
+        role="status"
+        style={
+          entries.length === 0
+            ? {
+                padding: '24px 16px',
+                textAlign: 'center',
+                fontSize: 'var(--atelier-fs-sm)',
+                color: 'var(--atelier-text-muted)',
+              }
+            : VISUALLY_HIDDEN
+        }
+      >
+        {entries.length === 0 ? emptyText : null}
+      </div>
       <div
         id={listId}
         role="listbox"
@@ -1290,18 +1326,7 @@ function PaletteContent({ onClose, recentIds, recordRecent, initialScope, histor
           padding: scope === 'all' && !narrowed ? '0 0 4px' : '4px 0',
         }}
       >
-        {entries.length === 0 ? (
-          <div
-            style={{
-              padding: '24px 16px',
-              textAlign: 'center',
-              fontSize: 'var(--atelier-fs-sm)',
-              color: 'var(--atelier-text-muted)',
-            }}
-          >
-            {emptyText}
-          </div>
-        ) : (
+        {entries.length === 0 ? null : (
           layout.groups.map((group) => {
             const views = group.entries.map((entry) => (
               <EntryView
@@ -1400,6 +1425,12 @@ export function CommandPalette({ registerApi }: PaletteShellProps) {
     setOpenScope('all');
   }, []);
 
+  const openCollections = React.useCallback(() => {
+    hints.recordSessionEvent('palette', 'opened');
+    setOpenScope('collections');
+    paletteControls.open();
+  }, [hints]);
+
   // ⌘P opens on Collections. The same rules as ⌘N and ⌘, (GlobalCommands): a
   // dialog that is already open keeps the key, and in a text field only ⌘
   // reaches it, since a bare Ctrl+P is macOS's previous-line.
@@ -1410,13 +1441,11 @@ export function CommandPalette({ registerApi }: PaletteShellProps) {
       if (origin?.closest('[role="dialog"], [role="alertdialog"]')) return;
       if (origin?.closest('input, textarea, select, [contenteditable]') && !e.metaKey) return;
       e.preventDefault();
-      hints.recordSessionEvent('palette', 'opened');
-      setOpenScope('collections');
-      paletteControls.open();
+      openCollections();
     };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [hints]);
+  }, [openCollections]);
 
   // Capture phase, registered once: focus has usually moved onto the search
   // input before Mantine reports the palette open, so the opener has to be
@@ -1430,11 +1459,12 @@ export function CommandPalette({ registerApi }: PaletteShellProps) {
   React.useEffect(() => {
     registerApi({
       open: openPalette,
+      openCollections,
       close: closePalette,
       toggle: togglePalette,
       isOpen: () => paletteStore.getState().opened,
     });
-  }, [registerApi, openPalette, closePalette, togglePalette]);
+  }, [registerApi, openPalette, openCollections, closePalette, togglePalette]);
 
   // History is a convenience: a failed read or write leaves the palette fully
   // usable. A failed read is logged, like the theme's; a failed write is a toast,

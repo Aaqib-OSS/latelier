@@ -123,22 +123,20 @@ describe('QueryBar → ExplainDrawer → Structure — Create an index for this 
     mountWorkspace();
 
     await openExplainMenu();
-    fireEvent.click(await screen.findByRole('menuitem', { name: 'queryPlanner' }));
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Explain plan' }));
 
-    const explainDialog = await screen.findByRole('dialog', { name: 'Explain plan' });
-    await waitFor(() => expect(explainDialog.textContent).toContain('COLLSCAN'));
+    const inspector = await screen.findByTestId('inspector');
+    await waitFor(() => expect(inspector.textContent).toContain('COLLSCAN'));
 
     const createButton = await screen.findByTestId('explain-create-index');
     fireEvent.click(createButton);
 
-    // Explain drawer closes.
-    await waitFor(() =>
-      expect(screen.queryByRole('dialog', { name: 'Explain plan' })).toBeNull(),
-    );
+    // The Inspector closes.
+    await waitFor(() => expect(screen.queryByTestId('inspector')).toBeNull());
 
     // Structure tab is now active.
     await waitFor(() => {
-      const tab = screen.getByRole('tab', { name: /Structure/ });
+      const tab = screen.getByRole('tab', { name: /Schema & indexes/ });
       expect(tab.getAttribute('aria-selected')).toBe('true');
     });
 
@@ -201,8 +199,8 @@ describe('QueryBar → ExplainDrawer → Structure — Create an index for this 
     mountWorkspace();
 
     await openExplainMenu();
-    fireEvent.click(await screen.findByRole('menuitem', { name: 'queryPlanner' }));
-    await screen.findByRole('dialog', { name: 'Explain plan' });
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Explain plan' }));
+    await screen.findByTestId('inspector');
     fireEvent.click(await screen.findByTestId('explain-create-index'));
 
     await screen.findByRole('dialog', { name: /New index/ });
@@ -252,8 +250,8 @@ describe('QueryBar → ExplainDrawer → Structure — Create an index for this 
     mountWorkspace();
 
     await openExplainMenu();
-    fireEvent.click(await screen.findByRole('menuitem', { name: 'queryPlanner' }));
-    await screen.findByRole('dialog', { name: 'Explain plan' });
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Explain plan' }));
+    await screen.findByTestId('inspector');
 
     fireEvent.click(await screen.findByTestId('explain-create-index'));
 

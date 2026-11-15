@@ -1,5 +1,7 @@
 import React from 'react';
-import { AppShell, Button, Group, Tabs } from '@mantine/core';
+import { AppShell, Button, Tabs, Tooltip } from '@mantine/core';
+import { formatShortcut } from '../../commands/shortcutLabel';
+import { isMacRenderer } from '../../utils/platform';
 import {
   Group as PanelGroup,
   Panel,
@@ -20,6 +22,7 @@ import type {
   WorkspaceTab,
   ConnectionSummary,
   AggregationTabState,
+  SavedQuerySummary,
   SchemaTabState,
 } from '@shared/types';
 import type { WorkspaceTabsState } from '../../state/workspaceTabs';
@@ -30,20 +33,24 @@ import type { UseReferenceRulesResult } from '../../features/references/useRefer
 import {
   asPercent,
   BUILDER_COLLAPSED_PX,
-  BUILDER_MIN_PCT,
+  BUILDER_DEFAULT_PX,
+  BUILDER_MAX_PX,
+  BUILDER_MIN_PX,
   isUserChosenBuilderSplit,
 } from './panelSizes';
 import { AggregationTab } from './Aggregation/AggregationTab';
-import { StructureView } from './StructureView';
+import { StructureViewConnected } from './StructureViewConnected';
 import type { IndexCreateRequest } from '../IndexesTab';
 import { QueryBar } from './QueryBar';
 import { ResultViewer } from './ResultViewer';
 import { BuilderPane } from './BuilderPane';
 import { openSavedPipeline, renameOpenPipelines } from './savedActions';
 import { ResizeHandle } from './ResizeHandle';
-import { DividerNotch } from './DividerNotch';
+import { Inspector, type InspectorTab, type PlanRequest } from './Inspector';
 import { MongoShellPane } from './MongoShellPane';
 import { ScriptTab } from './ScriptTab';
+import { ServerTab } from './ServerTab';
+import { closeTabGuarded } from './tabActions';
 import { CollectionHeader } from './CollectionHeader';
 import {
   CollectionWorkspaceProvider,
@@ -53,25 +60,30 @@ import {
 import { useConnectionTransfer } from '../../features/connections/ConnectionTransferProvider';
 import { useWorkspacePanelPrefs } from './useWorkspacePanelPrefs';
 import { ONE_PANEL_BUILDER_PX } from './sidePanels';
-import { GENERIC_CONNECT_ERROR } from './useNavigatorData';
+import { GENERIC_CONNECT_ERROR, type NavigatorData } from './useNavigatorData';
+import { ConnectedCanvas } from './ConnectedCanvas';
+import { WelcomeCanvas } from './WelcomeCanvas';
+import { mostRecentlyConnected } from './locationModel';
 import type { ConnectErrorInfo } from './navigatorTreeReducer';
 import { latestFailedConnection } from './resultPaneState';
 import { useCollectionTabActions } from './useCollectionTabActions';
 import { useDocumentDialogs } from './useDocumentDialogs';
 import type { ReferenceDrawerState } from './useReferenceDrawer';
 
+// The stored value stays `structure`: only the label changed, so no tab state migrates.
 const SUB_TABS: ReadonlyArray<{
   key: CollectionView;
   label: string;
   icon: React.ReactNode;
+  shortcut: string;
 }> = [
-  { key: 'documents', label: 'Documents', icon: I.doc },
-  { key: 'aggregation', label: 'Aggregation', icon: I.sum },
-  { key: 'structure', label: 'Structure', icon: I.schema },
+  { key: 'documents', label: 'Documents', icon: I.doc, shortcut: '⌥1' },
+  { key: 'aggregation', label: 'Aggregation', icon: I.sum, shortcut: '⌥2' },
+  { key: 'structure', label: 'Schema & indexes', icon: I.schema, shortcut: '⌥3' },
 ];
 
 /**
- * The Documents / Aggregation / Structure strip. Mantine's `Tabs` gives it the
+ * The Documents / Aggregation / Schema & indexes strip (W01 §14.5). Mantine's `Tabs` gives it the
  * tablist pattern (arrow keys, Home/End, a single tab stop, aria-controls). It
  * must sit inside the same `<Tabs>` root as the `Tabs.Panel`s: Mantine only
  * sets a tab's `aria-controls` once its panel is mounted. It shares its row with
@@ -93,8 +105,8 @@ function SubTabStrip({ active }: { active: CollectionView }) {
       {SUB_TABS.map((t) => {
         const selected = t.key === active;
         return (
+          <Tooltip key={t.key} label={`${t.label} ${formatShortcut(t.shortcut, isMacRenderer())}`} withArrow openDelay={400}>
           <Tabs.Tab
-            key={t.key}
             value={t.key}
             leftSection={
               <span aria-hidden="true" style={{ display: 'inline-flex', opacity: 0.7 }}>
@@ -105,8 +117,6 @@ function SubTabStrip({ active }: { active: CollectionView }) {
               padding: '0 11px',
               fontSize: T.fsXs,
               fontWeight: 600,
-              letterSpacing: 0.5,
-              textTransform: 'uppercase',
               whiteSpace: 'nowrap',
               background: 'transparent',
               color: selected ? T.text : T.textMuted,
@@ -118,6 +128,7 @@ function SubTabStrip({ active }: { active: CollectionView }) {
           >
             {t.label}
           </Tabs.Tab>
+          </Tooltip>
         );
       })}
     </Tabs.List>
@@ -227,15 +238,19 @@ export interface PanelBodyProps {
   initialLoadPending: boolean;
   anyConnectionOpen: boolean;
   switcherProps: Omit<ConnectionSwitcherProps, 'variant'>;
-  setNewTabOpen: (open: boolean) => void;
+  /** The navigator's cache and loaders, read by the no-tab canvas. */
+  navigatorData: Pick<NavigatorData, 'tree' | 'loadDbs' | 'loadColls'>;
+  /** The palette on its Collections scope. */
+  onSearchCollections: () => void;
   active: WorkspaceTab | null;
   openConnection: (id: string) => void;
+  /** The welcome canvas saved a Connection: list it, then connect it. */
+  onWelcomeSaved: (id: string) => void;
   activeScript: ScriptTabType | null;
   collection: PanelBodyCollectionProps | null;
   dark: boolean;
   builderPanelRef: React.RefObject<PanelImperativeHandle | null>;
   toggleBuilder: () => void;
-  notchRef: React.RefObject<HTMLButtonElement | null>;
   /** See `IndexCreateRequest` — scoped to `collection`'s own tab by the caller (`Workspace.tsx`) before it reaches here. */
   structureInitialCreate?: IndexCreateRequest | null;
   onStructureInitialCreateConsumed?: () => void;
@@ -258,20 +273,23 @@ export function PanelBody({
   initialLoadPending,
   anyConnectionOpen,
   switcherProps,
-  setNewTabOpen,
+  navigatorData,
+  onSearchCollections,
   active,
   openConnection,
+  onWelcomeSaved,
   activeScript,
   collection,
   dark,
   builderPanelRef,
   toggleBuilder,
-  notchRef,
   structureInitialCreate,
   onStructureInitialCreateConsumed,
   connectErrors,
 }: PanelBodyProps) {
   const T = themeVars;
+  // The Connection the breadcrumb names with no tab in front; the canvas names the same one.
+  const recentConnection = mostRecentlyConnected(switcherProps.connections);
   const failedConnection = anyConnectionOpen
     ? null
     : latestFailedConnection(switcherProps.connections, connectErrors);
@@ -291,12 +309,23 @@ export function PanelBody({
         }
       : undefined;
   const { openImport } = useConnectionTransfer();
-  // Bumped by every load that replaces the query wholesale (Reset, Saved and
-  // Recent run-here, all in BuilderPane). Lifted here because QueryBar needs
-  // it too: such a load re-derives the advanced row's open state, which a
-  // same-tab `hasAdvanced` change alone misses when the row already had
-  // values and was collapsed.
+  // Bumped by every load that replaces the query wholesale: Reset in the
+  // builder, a Saved or History load from the Filter Bar row. Lifted here
+  // because the two are siblings, and the builder reseeds its tree on it.
   const [ownLoadGen, bumpLoadGen] = React.useReducer((n: number) => n + 1, 0);
+  // The Saved list's handlers, stable so the memoized QueryBar is not
+  // re-rendered by every pass through here.
+  const openSavedInTab = React.useCallback(
+    (saved: SavedQuerySummary) => {
+      if (saved.kind === 'aggregation') void openSavedPipeline(tabs, saved);
+      else if (saved.kind === 'script') void tabs.openScript({ connectionId: saved.connectionId });
+    },
+    [tabs],
+  );
+  const renameSavedPipelines = React.useCallback(
+    (saved: SavedQuerySummary, name: string) => renameOpenPipelines(tabs, saved.id, name),
+    [tabs],
+  );
   // The header sits above every view, so it never remounts: it re-reads its
   // counts after a document write and after Structure changes an index. Not on
   // a view switch: each read is a server-side stats aggregation. An Aggregation
@@ -307,7 +336,7 @@ export function PanelBody({
   const {
     prefsReady,
     refDrawerWidth, setRefDrawerWidth, commitRefDrawerWidth,
-    innerHSplit, commitInnerHSplit,
+    innerHSplit, innerHSplitStored, commitInnerHSplit,
     shellSplit, commitShellSplit,
     builderCollapsed,
     onePanelOnly,
@@ -327,6 +356,34 @@ export function PanelBody({
   // without writing the saved pref, so Documents gets it back at its own width.
   const onDocuments = collection?.view === 'documents';
   const builderShut = builderCollapsed || !onDocuments;
+
+  // The Inspector (W05 §9.7): which tab shows, and what Plan explains. The
+  // plan belongs to the tab it was asked for, so another tab never shows it.
+  const [inspectorTab, setInspectorTab] = React.useState<InspectorTab>('filter');
+  const [planRequest, setPlanRequest] = React.useState<PlanRequest | null>(null);
+  const collectionTabId = collection?.tab.id;
+  const expandInspector = collection?.actions.expandBuilder;
+  const openPlan = React.useCallback<NonNullable<CollectionWorkspaceActions['openPlan']>>(
+    (request) => {
+      if (!collectionTabId) return;
+      setPlanRequest((prev) => ({ ...request, tabId: collectionTabId, seq: (prev?.seq ?? 0) + 1 }));
+      setInspectorTab('plan');
+      expandInspector?.();
+    },
+    [collectionTabId, expandInspector],
+  );
+  // Closed, it opens on Filter again, whichever tab it was last on.
+  const [wasCollapsed, setWasCollapsed] = React.useState(builderCollapsed);
+  if (wasCollapsed !== builderCollapsed) {
+    setWasCollapsed(builderCollapsed);
+    if (builderCollapsed) setInspectorTab('filter');
+  }
+  const plan = planRequest?.tabId === collectionTabId ? planRequest : null;
+  const shownInspectorTab: InspectorTab = plan ? inspectorTab : 'filter';
+  const providerActions = React.useMemo(
+    () => (collection ? { ...collection.actions, openPlan } : null),
+    [collection?.actions, openPlan], // eslint-disable-line react-hooks/exhaustive-deps
+  );
   const {
     refStack, setRefStack,
     refDrawerPinned, setRefDrawerPinned,
@@ -348,6 +405,30 @@ export function PanelBody({
   React.useEffect(() => {
     builderDividerUsed.current = false;
   }, [collection?.view]);
+  // W01 §14.11: ⌘↓ moves from the filter into the rows, Esc from the rows back.
+  // The view's root is the one tab stop of its widget, so focusing it lands on
+  // the first row; a dialog (whose events bubble here through its portal) and
+  // a field being edited in a row keep their own keys.
+  const handleResultsLoop = (e: React.KeyboardEvent<HTMLElement>) => {
+    if (!onDocuments || e.defaultPrevented) return;
+    const target = e.target instanceof Element ? e.target : null;
+    if (!target || target.closest('[role="dialog"], [role="alertdialog"]')) return;
+    const viewRoot = '[role="tree"][aria-label="Documents"], [role="grid"][aria-label="Documents"]';
+    if (e.key === 'ArrowDown' && (e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey) {
+      const root = e.currentTarget.querySelector<HTMLElement>(viewRoot);
+      if (!root) return;
+      e.preventDefault();
+      root.focus();
+    } else if (
+      e.key === 'Escape' &&
+      !e.metaKey && !e.ctrlKey && !e.shiftKey && !e.altKey &&
+      target.closest(viewRoot) &&
+      !target.closest('input, textarea, select, [contenteditable="true"]')
+    ) {
+      e.preventDefault();
+      document.getElementById('query-bar-filter')?.focus();
+    }
+  };
   const handleRunShortcut = (e: React.KeyboardEvent) => {
     if (e.key !== 'Enter' || !(e.metaKey || e.ctrlKey) || e.shiftKey || e.altKey) return;
     if (e.target instanceof Element && e.target.closest('[role="dialog"], [role="alertdialog"]')) {
@@ -358,6 +439,10 @@ export function PanelBody({
     // Also stops a focused Run button's native Enter activation from running twice.
     e.preventDefault();
     run();
+  };
+  const handlePanelKeys = (e: React.KeyboardEvent<HTMLElement>) => {
+    handleRunShortcut(e);
+    handleResultsLoop(e);
   };
 
   return (
@@ -392,6 +477,13 @@ export function PanelBody({
           <CenteredPane>
             <span>Loading workspace…</span>
           </CenteredPane>
+        ) : switcherProps.connections.length === 0 ? (
+          // Nothing saved: no workbench to show, so the pane is the way in.
+          <WelcomeCanvas
+            onSaved={onWelcomeSaved}
+            onEnterManually={() => switcherProps.onAdd?.()}
+            onImport={openImport}
+          />
         ) : tabs.tabs.length === 0 && failedConnection ? (
           <ConnectionPane
             conn={failedConnection}
@@ -399,32 +491,35 @@ export function PanelBody({
             onConnect={() => openConnection(failedConnection.id)}
             extraActions={<ConnectionSwitcher {...switcherProps} variant="cta" />}
           />
+        ) : tabs.tabs.length === 0 && recentConnection ? (
+          <ConnectedCanvas
+            key={recentConnection.id}
+            connection={recentConnection}
+            cache={ownGet(navigatorData.tree.caches, recentConnection.id)}
+            loadDbs={(id) => void navigatorData.loadDbs(id)}
+            loadColls={(id, db) => void navigatorData.loadColls(id, db)}
+            onOpen={(input) => void tabs.openCollection({ ...input, reuseExisting: true })}
+            onSearch={onSearchCollections}
+          />
         ) : tabs.tabs.length === 0 ? (
           <CenteredPane>
             <div style={{ textAlign: 'center', maxWidth: 320 }}>
               <div style={{ color: T.textMuted, marginBottom: 12 }}>
-                {anyConnectionOpen
-                  ? 'Select a collection from the sidebar to get started.'
-                  : switcherProps.connections.length === 0
-                    ? 'No connections yet. Add one to get started.'
-                    : 'No connection is open. Select one to get started.'}
+                No connection is open. Select one to get started.
               </div>
-              {anyConnectionOpen ? (
-                <Button variant="filled" size="xs" leftSection={I.plus} onClick={() => setNewTabOpen(true)}>
-                  Open a collection
-                </Button>
-              ) : (
-                <Group gap="xs" justify="center">
-                  <ConnectionSwitcher {...switcherProps} variant="cta" />
-                  {switcherProps.connections.length === 0 && (
-                    <Button variant="default" size="xs" onClick={() => openImport()}>
-                      Import connections
-                    </Button>
-                  )}
-                </Group>
-              )}
+              <ConnectionSwitcher {...switcherProps} variant="cta" />
             </div>
           </CenteredPane>
+        ) : active?.kind === 'server' ? (
+          // Before the dormant pane: a server tab's Overview is where a dormant Connection reconnects.
+          <ServerTab
+            tab={active}
+            connection={switcherProps.connections.find((c) => c.id === active.connectionId) ?? null}
+            onSection={(id, section) => tabs.patchServerState(id, { section })}
+            onDelete={switcherProps.onDelete}
+            onDisconnect={switcherProps.onDisconnect}
+            onClose={(id) => void closeTabGuarded(tabs, id)}
+          />
         ) : active && isKnownNotConnected(focusedConnection) && !connectionLost ? (
           // Never render the result grid off a stale cache while the tab's own connection is dormant.
           <ConnectionPane
@@ -436,6 +531,7 @@ export function PanelBody({
           <ScriptTab
             tab={activeScript}
             defaultDb={focusedConnection?.defaultDb}
+            connectionName={focusedConnection?.name}
             onPatch={patchActiveScript}
           />
         ) : collection ? (
@@ -443,7 +539,7 @@ export function PanelBody({
             // so its drafts and filter undo history survive the round trip.
             <CollectionWorkspaceProvider
               state={collection.tab.state}
-              actions={collection.actions}
+              actions={providerActions ?? collection.actions}
               meta={collection.meta}
             >
               <Tabs
@@ -480,7 +576,7 @@ export function PanelBody({
                 key={`h-${String(prefsReady)}`}
                 orientation="horizontal"
                 style={{ flex: 1, overflow: 'hidden' }}
-                onKeyDown={handleRunShortcut}
+                onKeyDown={handlePanelKeys}
                 onLayoutChanged={(layout) => {
                   // Only the divider is a choice to store. Layouts also change when a
                   // window crosses the one-panel width, and the drawer passes through
@@ -500,12 +596,18 @@ export function PanelBody({
                   minSize={320}
                   style={{ display: 'flex', flexDirection: 'column', overflow: 'hidden', minWidth: 0 }}
                 >
-                  <Tabs.Panel value="documents" style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0, minWidth: 0 }}>
+                  {/* Positioned: the selection pill floats at the bottom centre of this canvas. */}
+                  <Tabs.Panel value="documents" style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0, minWidth: 0, position: 'relative' }}>
                     <>
                       <QueryBar
                         suggestionContext={collection.suggestionContext}
-                        loadGen={loadGen}
                         runShortcutRef={runShortcutRef}
+                        savedRefreshKey={collection.savedRefreshKey}
+                        onLoaded={bumpLoadGen}
+                        onOpenInTab={openSavedInTab}
+                        onSavedRenamed={renameSavedPipelines}
+                        builderOpen={!builderCollapsed}
+                        onToggleBuilder={toggleBuilder}
                       />
                       <ResultViewer>
                         <ResultViewer.Pagination
@@ -569,7 +671,7 @@ export function PanelBody({
                     />
                   </Tabs.Panel>
                   <Tabs.Panel value="structure" style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0, minWidth: 0 }}>
-                    <StructureView
+                    <StructureViewConnected
                       connectionId={collection.tab.connectionId}
                       dbName={collection.tab.dbName}
                       collection={collection.tab.collection}
@@ -578,6 +680,7 @@ export function PanelBody({
                       initialCreate={structureInitialCreate}
                       onInitialCreateConsumed={onStructureInitialCreateConsumed}
                       onChanged={bumpStructureChanges}
+                      readOnly={focusedConnection?.readOnly ?? false}
                     />
                   </Tabs.Panel>
                 </Panel>
@@ -589,7 +692,7 @@ export function PanelBody({
                     position: 'relative',
                     zIndex: 2,
                   }}
-                  aria-label="Resize Query Builder"
+                  aria-label="Resize inspector"
                   // A drag off Documents would open a panel whose builder is hidden.
                   disabled={!onDocuments}
                   // Only a live divider is a choice: off Documents a stray press would
@@ -606,8 +709,16 @@ export function PanelBody({
                 <Panel
                   id="h-builder"
                   panelRef={builderPanelRef}
-                  defaultSize={builderShut ? BUILDER_COLLAPSED_PX : asPercent(innerHSplit)}
-                  minSize={onePanelOnly ? ONE_PANEL_BUILDER_PX : asPercent(BUILDER_MIN_PCT)}
+                  defaultSize={
+                    builderShut
+                      ? BUILDER_COLLAPSED_PX
+                      : innerHSplitStored
+                        ? asPercent(innerHSplit)
+                        : BUILDER_DEFAULT_PX
+                  }
+                  // Pixels (W05 §9.7): 320 to 640, whatever the window.
+                  minSize={onePanelOnly ? ONE_PANEL_BUILDER_PX : BUILDER_MIN_PX}
+                  maxSize={onePanelOnly ? undefined : BUILDER_MAX_PX}
                   // Only once the toggle has asked for it: while open, a drag stops at
                   // the minimum. Otherwise it could collapse the panel without
                   // `builderCollapsed` knowing, leaving no way to reopen it. Workspace's
@@ -623,19 +734,8 @@ export function PanelBody({
                         height: '100%',
                         borderLeft: `1px solid ${T.border}`,
                         background: T.surface,
-                        position: 'relative',
                       }}
-                    >
-                      {onDocuments && (
-                        <DividerNotch
-                          side="left"
-                          collapsed
-                          onClick={toggleBuilder}
-                          ariaLabel="Open Query Builder"
-                          buttonRef={notchRef}
-                        />
-                      )}
-                    </div>
+                    />
                   ) : (
                     <div
                       style={{
@@ -647,43 +747,35 @@ export function PanelBody({
                     >
                       {/* Hidden, not unmounted, off Documents: see builderShut. */}
                       <div style={{ height: '100%', display: onDocuments ? undefined : 'none' }}>
-                        <BuilderPane
-                          savedRefreshKey={collection.savedRefreshKey}
-                          loadGen={loadGen}
-                          onLoaded={bumpLoadGen}
-                          onOpenInTab={(saved) => {
-                            if (saved.kind === 'aggregation') {
-                              void openSavedPipeline(tabs, saved);
-                            } else if (saved.kind === 'script') {
-                              void tabs.openScript({ connectionId: saved.connectionId });
-                            }
+                        <Inspector
+                          tab={shownInspectorTab}
+                          onTabChange={(next) => {
+                            if (next === 'plan' && !plan) openPlan({ verbosity: 'queryPlanner' });
+                            else setInspectorTab(next);
                           }}
-                          onSavedRenamed={(saved, name) => renameOpenPipelines(tabs, saved.id, name)}
-                          onOpenAsPipeline={(stages) => {
-                            tabs
-                              .openAggregation({
-                                connectionId: collection.tab.connectionId,
-                                dbName: collection.tab.dbName,
-                                collection: collection.tab.collection,
-                                initialState: { stages, activeStageId: null, dirty: true },
-                              })
-                              .catch((e: unknown) =>
-                                notify.error(getErrorMessage(e, String(e)), {
-                                  title: 'Could not open the pipeline',
-                                }),
-                              );
-                          }}
-                        />
+                          onClose={toggleBuilder}
+                          plan={plan}
+                        >
+                          <BuilderPane
+                            loadGen={loadGen}
+                            onLoaded={bumpLoadGen}
+                            onOpenAsPipeline={(stages) => {
+                              tabs
+                                .openAggregation({
+                                  connectionId: collection.tab.connectionId,
+                                  dbName: collection.tab.dbName,
+                                  collection: collection.tab.collection,
+                                  initialState: { stages, activeStageId: null, dirty: true },
+                                })
+                                .catch((e: unknown) =>
+                                  notify.error(getErrorMessage(e, String(e)), {
+                                    title: 'Could not open the pipeline',
+                                  }),
+                                );
+                            }}
+                          />
+                        </Inspector>
                       </div>
-                      {onDocuments && (
-                        <DividerNotch
-                          side="left"
-                          collapsed={false}
-                          onClick={toggleBuilder}
-                          ariaLabel="Collapse Query Builder"
-                          buttonRef={notchRef}
-                        />
-                      )}
                     </div>
                   )}
                 </Panel>

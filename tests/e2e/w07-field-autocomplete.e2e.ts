@@ -52,8 +52,9 @@ test('autocomplete: focusing builder field input lists known fields; click fills
 
       // Add a condition row, focus its field input → popover opens on focus
       // (`BuilderPane.tsx:109` — onFocus={() => setFieldPopoverOpen(true)}).
+      await ws.openBuilder();
       await win.getByRole('button', { name: 'Add condition' }).click();
-      const fieldInput = win.getByPlaceholder('field').first();
+      const fieldInput = win.getByPlaceholder('field', { exact: true }).first();
       await fieldInput.click();
 
       // Popover lists known fields. Pick `stockLevel` — unique enough to be
@@ -91,10 +92,8 @@ async function openEmptyMatchStage(
   const ws = new WorkspacePage(win);
   await ws.openCollectionFromNavigator('shop', 'orders');
   await ws.tablist.getByRole('tab', { name: /Aggregation/ }).click();
-  await expect(win.getByText('Pipeline output')).toBeVisible({ timeout: 5000 });
-  await win.getByRole('button', { name: /Add stage/ }).first().click();
-  await win.getByRole('textbox', { name: 'Search stages' }).fill('match');
-  await win.getByText('$match', { exact: true }).first().click();
+  await expect(win.getByText('Add a first stage')).toBeVisible({ timeout: 5000 });
+  await win.getByRole('button', { name: '$match', exact: true }).click();
   const body = win.locator('[data-testid="stage-body-editor-1"] .cm-content');
   await expect(body).toBeVisible({ timeout: 5000 });
   await body.click();
@@ -158,14 +157,17 @@ test('autocomplete: a value from an aggregation $match is offered in the builder
       // Close the completion list (if any) so Run is not hidden under it.
       await win.keyboard.press('Escape');
       await win.getByRole('button', { name: 'Run', exact: true }).click();
-      await expect(win.getByText('The pipeline returned no documents')).toBeVisible({ timeout: 8000 });
+      // The selected stage keeps the preview (A01 §9.4); the full run's count is on the Output row.
+      await expect(win.getByRole('button', { name: 'Output 0 documents' })).toBeVisible({ timeout: 8000 });
 
       await ws.tablist.getByRole('tab', { name: /Documents/ }).click();
+      // The builder is closed by default and lives in the Inspector (W05 §9.7).
+      await ws.openBuilder();
       await win.getByRole('button', { name: 'Add condition' }).click();
-      await win.getByPlaceholder('field').first().fill('status');
+      await win.getByPlaceholder('field', { exact: true }).first().fill('status');
       // The field popover stays open over the value box until dismissed.
       await win.keyboard.press('Escape');
-      const value = win.getByPlaceholder('value').first();
+      const value = win.getByPlaceholder('value', { exact: true }).first();
       await value.click();
 
       const popover = win.getByRole('listbox', { name: 'Value suggestions' });

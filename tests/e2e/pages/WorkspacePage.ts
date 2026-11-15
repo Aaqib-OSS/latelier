@@ -25,8 +25,19 @@ export class WorkspacePage {
   // Tab strip (uses role="tab" + aria-selected)
   get tablist() { return this.win.locator('[role="tablist"][aria-label="Collection view"]'); }
 
-  /** "+ Script" button in the top-level tab strip — opens a new Script tab. */
-  get newScriptTab() { return this.win.locator('[aria-label="New script tab"]'); }
+  /** The tab strip's `+ ▾` menu button. */
+  get newTabMenu() { return this.win.getByRole('button', { name: 'New tab', exact: true }); }
+
+  /** Opens a new Script tab from the tab strip's `+ ▾` menu. */
+  async openNewScript() {
+    await this.newTabMenu.click();
+    await this.win.getByRole('menuitem', { name: 'New script', exact: true }).click();
+  }
+
+  /** Closes the tab strip's tab with this label (the label its × names). */
+  async closeTab(label: string) {
+    await this.win.getByRole('button', { name: `Close ${label}`, exact: true }).click();
+  }
 
   /** Treeitem for a database — uses the data-testid baked into the navigator. */
   dbRow(dbName: string) {
@@ -34,8 +45,22 @@ export class WorkspacePage {
   }
 
   /**
+   * The navigator's `Server` control on a Connection root (C05 §11.2): drawn on
+   * hover or focus, so the root is hovered first. Opens the Connection's server tab.
+   */
+  async openServerFromNavigator(connectionName: string) {
+    // An open Switcher popover covers the navigator's hover-revealed button.
+    if (await this.switcher.listbox.isVisible()) {
+      await this.switcher.trigger.click();
+      await expect(this.switcher.listbox).toHaveCount(0);
+    }
+    await this.win.locator('[data-testid="nav-connection"]').filter({ hasText: connectionName }).hover();
+    await this.win.getByRole('button', { name: `Server overview for ${connectionName}` }).click();
+  }
+
+  /**
    * The navigator's connection-level "Refresh" button — re-fetches the DB list.
-   * Scoped to the navigator: Structure has Refresh buttons of its own.
+   * Scoped to the navigator: Schema & indexes has a Refresh button of its own.
    */
   get navigatorRefreshButton() { return this.navigator.getByRole('button', { name: 'Refresh' }); }
 
@@ -51,28 +76,51 @@ export class WorkspacePage {
   get queryBarRunButton() { return this.win.locator('[data-testid="query-run-btn"]'); }
 
   /**
-   * The collapsible advanced row (sort / skip / limit). Only in
-   * the DOM while expanded, so presence is the open/closed assertion (W14 §8).
+   * The grid of every option, which replaces the pills on a tab with "Keep
+   * options expanded" on. Only in the DOM then, so presence is the assertion
+   * (W05 §9.2).
    */
   get queryBarAdvanced() { return this.win.locator('#query-bar-advanced'); }
 
-  /** The QUERY label cell doubles as the advanced row's expand/collapse trigger. */
-  get queryBarAdvancedToggle() { return this.win.locator('[aria-controls="query-bar-advanced"]'); }
+  /** An option's pill in the Filter Bar row: `sort`, `project`, `limit`, or one promoted out of More. */
+  optionPill(key: string) { return this.win.locator(`[data-testid="option-pill-${key}"]`); }
 
-  /** The result bar's Fields control trigger; its name gains a badge's text when one shows. */
-  // `aria-haspopup`: a Tab Group header is named after its Connection, so a
-  // Connection called "Fields …" would otherwise match too.
-  get fieldsButton() {
-    return this.win.getByRole('button', { name: /^Fields/ }).and(this.win.locator('[aria-haspopup="dialog"]'));
+  /** The row's `⋯ More` menu: the unset options and "Keep options expanded". */
+  get queryBarMore() { return this.win.locator('[data-testid="query-bar-more"]'); }
+
+  /** Opens an option's editor from its pill, or from More while it is unset there. */
+  async openOption(key: string, nameInMore?: string) {
+    if (nameInMore !== undefined && (await this.optionPill(key).count()) === 0) {
+      await this.queryBarMore.click();
+      await this.win.getByRole('menuitem', { name: nameInMore, exact: true }).click();
+      return;
+    }
+    await this.optionPill(key).click();
   }
+
+  /** Turns this tab's "Keep options expanded" on or off from More. */
+  async toggleOptionsExpanded() {
+    await this.queryBarMore.click();
+    await this.win.getByRole('menuitemcheckbox', { name: 'Keep options expanded' }).click();
+  }
+
+  /** Opens the Query Builder from the Filter Bar row when it is closed, which it is by default. */
+  async openBuilder() {
+    const toggle = this.win.locator('[data-testid="filter-bar-row"]').getByRole('button', { name: 'Builder', exact: true });
+    if ((await toggle.getAttribute('aria-pressed')) !== 'true') await toggle.click();
+    await expect(toggle).toHaveAttribute('aria-pressed', 'true');
+  }
+
+  /** The Project pill: the Fields control's trigger, in the Filter Bar row. */
+  get fieldsButton() { return this.optionPill('project'); }
 
   /** Projection input in the Fields control's "fetch" section — only while the control is open. */
   get fieldsProjection() { return this.win.locator('[data-testid="fields-projection"]'); }
 
-  /** SORT input inside the advanced row. */
+  /** Sort input: in the Sort pill's editor, or in the grid. */
   get queryBarSort() { return this.win.locator('[data-testid="query-bar-sort"]'); }
 
-  /** LIMIT input inside the advanced row. */
+  /** Limit input: in the Limit pill's editor, or in the grid. */
   get queryBarLimit() { return this.win.locator('[data-testid="query-bar-limit"]'); }
 
   /** SKIP — read-only; driven by the pager (W15 §4.4). */
@@ -92,17 +140,17 @@ export class WorkspacePage {
   /** The QueryBar "Run options" chevron — opens the Run/Explain menu. */
   get queryBarRunOptionsButton() { return this.win.locator('[data-testid="query-run-options-btn"]'); }
 
-  /** ResultBar "Documents" menu trigger — hosts bulk/destructive document actions. */
-  get resultOverflowMenuButton() { return this.win.getByRole('button', { name: 'Documents' }); }
+  /** The canvas header's `⋯` menu trigger — hosts bulk and data actions. */
+  get resultOverflowMenuButton() { return this.win.getByRole('button', { name: 'More actions', exact: true }); }
 
-  /** "Delete all matching…" item inside the ResultBar "Documents" menu. */
+  /** "Delete matching…" item inside the canvas header's `⋯` menu. */
   get deleteAllMatchingMenuItem() {
-    return this.win.getByRole('menuitem', { name: /Delete all matching/ });
+    return this.win.getByRole('menuitem', { name: /Delete matching/ });
   }
 
-  /** "Update all matching…" item inside the ResultBar "Documents" menu. */
+  /** "Update matching…" item inside the canvas header's `⋯` menu. */
   get updateAllMatchingMenuItem() {
-    return this.win.getByRole('menuitem', { name: /Update all matching/ });
+    return this.win.getByRole('menuitem', { name: /Update matching/ });
   }
 
   // T0.4 — contextual bulk-action bar, visible once ≥1 result row is selected.
@@ -157,13 +205,30 @@ export class WorkspacePage {
     await expect(row).toBeVisible({ timeout: 1000 });
   }
 
+  /**
+   * Click a DB row, and return once its collection list has stopped reloading.
+   * An expand re-fetches a list the navigator already holds (cached earlier,
+   * possibly before a later seed landed), and the rows shift when the answer
+   * arrives. A click aimed at a row before then can land on its neighbour.
+   * The spinner is raised synchronously by the click, so "gone" means settled.
+   */
+  async toggleDb(dbName: string) {
+    await this.dbRow(dbName).click();
+    await expect(this.win.locator(`[data-testid="nav-db-spinner-${dbName}"]`)).toHaveCount(0, {
+      timeout: 10_000,
+    });
+  }
+
   /** Click a DB row, then a collection row, and wait for its tab to be active. */
   async openCollectionFromNavigator(dbName: string, collection: string) {
     await this.waitForDb(dbName);
     // Expand the DB if not already; clicking the row toggles expansion.
-    await this.dbRow(dbName).click();
+    await this.toggleDb(dbName);
     await expect(this.collectionRow(dbName, collection)).toBeVisible({ timeout: 5000 });
-    await this.collectionRow(dbName, collection).click();
+    // A double-click keeps the tab: a single click opens the preview tab,
+    // which the next single click on another collection replaces, and specs
+    // that open two collections expect both to stay.
+    await this.collectionRow(dbName, collection).dblclick();
     // The navigator row's own selection follows the focused tab's database
     // and collection. A tab-name check can't tell same-named collections in
     // two databases apart: with one already open it either matches both

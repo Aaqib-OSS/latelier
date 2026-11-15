@@ -19,14 +19,18 @@ export const asPercent = (pct: number): string => `${pct}%`;
 export const BUILDER_MIN_PCT = 15;
 
 /**
- * Width of the collapsed rail, in pixels: 4 px is what the expand notch needs,
- * and 4% would be tens of pixels too wide. Non-zero so the notch has somewhere
- * to live, which is exactly why `pct === 0` is not a usable test for "collapsed".
+ * Width of the collapsed rail, in pixels: a 4% rail would be tens of pixels too
+ * wide. Non-zero, which is why `pct === 0` is not a usable test for "collapsed".
  */
 export const BUILDER_COLLAPSED_PX = 4;
 
 /** Fallback split when nothing is stored: 26 ≈ 348 / 1344. */
 export const BUILDER_DEFAULT_PCT = 26;
+
+/** The Inspector's width in pixels (W05 §9.7): what it opens at before anyone resizes it, and its bounds. */
+export const BUILDER_DEFAULT_PX = 400;
+export const BUILDER_MIN_PX = 320;
+export const BUILDER_MAX_PX = 640;
 
 /**
  * Did the user choose this width, or did we?

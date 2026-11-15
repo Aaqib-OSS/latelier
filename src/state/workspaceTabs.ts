@@ -7,16 +7,22 @@ import type {
   ResultViewMode,
   ScriptTab,
   ScriptTabState,
+  ServerSection,
+  ServerTab,
+  ServerTabState,
   WorkspaceTab,
 } from '@shared/types';
 import { DEFAULT_AGGREGATION_TAB_STATE } from '@shared/defaults';
 import type { AggregationSeed, IpcError } from '@shared/ipc';
 import { confirmDestructive } from '../utils/confirm';
-import { api, isIpcError } from '../api/atelier';
+import { api, getErrorMessage, isIpcError } from '../api/atelier';
 import { logFailure } from '../utils/rendererLog';
 import { notify } from '../theme/notifications';
 import { applyPendingPatches, carryResultFields, stripResultPatch } from './tabResultCarry';
 import { registerFlusher } from './pendingFlush';
+import { keepsPreview, nextScriptTitle } from '../pages/Workspace/tabActions';
+import { forgetScroll } from '../pages/Workspace/views/scrollMemory';
+import { closedTabOf, pushClosed, liveClosed, withoutClosed, type ClosedTab } from './closedTabs';
 
 /**
  * Global sticky-default prefs key (T0.5 / W07 §1). Stores the last page size
@@ -53,11 +59,31 @@ export interface WorkspaceTabsState {
   loading: boolean;
   error: IpcError | null;
   refresh: () => Promise<void>;
+  /**
+   * W01 §14.9 — the one tab a single navigator click opens, replaced by the
+   * next such click until something keeps it. Renderer memory only: after a
+   * relaunch every restored tab is kept.
+   */
+  previewId: string | null;
+  /** Draws the preview tab upright for good; a no-op for any other tab. */
+  keepTab: (id: string) => void;
+  /**
+   * `preview`: open as the preview tab, replacing the current one. A
+   * collection that already has a tab is focused either way, and any open
+   * that is not a preview keeps the tab it lands on.
+   */
   openCollection: (input: {
     connectionId: string;
     dbName: string;
     collection: string;
     reuseExisting?: boolean;
+    preview?: boolean;
+    /**
+     * Seeds a brand-new tab's state at creation in main, over the sticky
+     * defaults, so it never depends on a render. Ignored when the open lands
+     * on an existing tab.
+     */
+    initialState?: Partial<CollectionTabState>;
   }) => Promise<CollectionTab>;
   /**
    * Opens the collection's Aggregation view. With a `savedId`, a `name` or an
@@ -77,7 +103,20 @@ export interface WorkspaceTabsState {
     connectionId: string;
     initialState?: Partial<ScriptTabState>;
   }) => Promise<ScriptTab>;
+  /** C05 §11 — opens or focuses the Connection's server tab. */
+  openServer: (input: { connectionId: string; section?: ServerSection }) => Promise<ServerTab>;
+  /**
+   * Closes one tab. A script tab holding source says so in a toast with Undo,
+   * and every tab closed this way joins the reopen list (W01 §14.8).
+   */
   close: (id: string) => Promise<void>;
+  /** How many closed tabs `reopenClosed` can still bring back (before the Connection check). */
+  closedCount: number;
+  /**
+   * W01 §14.8 — reopens the newest closed tab whose Connection `isLive`, with
+   * its state. False when there was nothing to reopen.
+   */
+  reopenClosed: (isLive: (connectionId: string) => boolean) => Promise<boolean>;
   /**
    * X16 §7 — close one Connection's tabs. This inverts the old
    * `closeAll(keepConnectionId?)`, whose meaning was "close every tab NOT on
@@ -143,6 +182,7 @@ export interface WorkspaceTabsState {
    * as collection-tab patches.
    */
   patchScriptState: (id: string, patch: Partial<ScriptTabState>) => void;
+  patchServerState: (id: string, patch: Partial<ServerTabState>) => void;
 }
 
 const DEBOUNCE_MS = 250;
@@ -175,6 +215,25 @@ export function useWorkspaceTabs(): WorkspaceTabsState {
 
   const activeId = tabs.find((t) => t.isActive)?.id ?? null;
 
+  const [previewId, setPreviewId] = useState<string | null>(null);
+  const previewRef = useRef<string | null>(null);
+  const setPreview = useCallback((id: string | null) => {
+    previewRef.current = id;
+    setPreviewId(id);
+  }, []);
+  const keepTab = useCallback(
+    (id: string) => {
+      if (previewRef.current === id) setPreview(null);
+    },
+    [setPreview],
+  );
+  // The tabs the last list returned, pending patches applied. `tabsRef` only
+  // catches up after a render, too late for an open straight after another.
+  const listed = useRef<readonly WorkspaceTab[]>([]);
+  // Opens run one at a time, so each reads the preview and the open tabs as
+  // the one before left them, whatever order main answers in.
+  const openChain = useRef<Promise<unknown>>(Promise.resolve());
+
   const refresh = useCallback(async () => {
     try {
       // Main handles the list and the updates in dispatch order, so a flush
@@ -190,6 +249,7 @@ export function useWorkspaceTabs(): WorkspaceTabsState {
         applyPendingPatches(list, before),
         pendingPatches.current,
       );
+      listed.current = current;
       setTabs((prev) => carryResultFields(prev, current));
       setError(null);
     } catch (e) {
@@ -205,8 +265,17 @@ export function useWorkspaceTabs(): WorkspaceTabsState {
     });
   }, [refresh]);
 
-  const openCollection: WorkspaceTabsState['openCollection'] = useCallback(
-    async (input) => {
+  const openCollectionTab = useCallback(
+    async ({
+      initialState: given,
+      ...input
+    }: {
+      connectionId: string;
+      dbName: string;
+      collection: string;
+      reuseExisting?: boolean;
+      initialState?: Partial<CollectionTabState>;
+    }) => {
       // Seed brand-new tabs from the sticky page-size default. A `null`
       // (never-set) pref is deliberately omitted rather than coerced to a
       // number — `WorkspaceStateService.openCollection` falls back to
@@ -243,7 +312,8 @@ export function useWorkspaceTabs(): WorkspaceTabsState {
       } catch (err) {
         logFailure(`reading preference ${DEFAULT_VIEW_PREF_KEY}`, err);
       }
-      const initialState = Object.keys(seed).length > 0 ? seed : undefined;
+      const merged = { ...seed, ...given };
+      const initialState = Object.keys(merged).length > 0 ? merged : undefined;
       const tab = await api.tabs.openCollection({
         ...input,
         ...(initialState ? { initialState } : {}),
@@ -252,6 +322,38 @@ export function useWorkspaceTabs(): WorkspaceTabsState {
       return tab;
     },
     [refresh],
+  );
+
+  const openCollection: WorkspaceTabsState['openCollection'] = useCallback(
+    ({ preview, ...input }) => {
+      const run = async (): Promise<CollectionTab> => {
+        if (!preview) {
+          const tab = await openCollectionTab(input);
+          keepTab(tab.id);
+          return tab;
+        }
+        const before = new Set(listed.current.map((t) => t.id));
+        const tab = await openCollectionTab({ ...input, reuseExisting: true });
+        // Landing on a tab that was already open focuses it and leaves the
+        // preview where it was.
+        if (before.has(tab.id)) return tab;
+        const replaced = previewRef.current;
+        setPreview(tab.id);
+        // The new tab is already in front, so closing the old one never
+        // hands focus to a neighbour first.
+        if (replaced && listed.current.some((t) => t.id === replaced)) {
+          await api.tabs.close(replaced);
+          await refresh();
+        }
+        return tab;
+      };
+      const result = openChain.current.then(run, run);
+      // The caller still gets the rejection through `result`; only the next
+      // link must not inherit it.
+      openChain.current = result.catch(() => undefined);
+      return result;
+    },
+    [openCollectionTab, keepTab, setPreview, refresh],
   );
 
   const openAggregation: WorkspaceTabsState['openAggregation'] = useCallback(
@@ -287,27 +389,91 @@ export function useWorkspaceTabs(): WorkspaceTabsState {
         delete pending.activeView;
         if (replaces) delete pending.aggregation;
       }
+      // Main switched the view without a patch; a view change keeps the tab.
+      keepTab(tab.id);
+      await refresh();
+      return tab;
+    },
+    [refresh, keepTab],
+  );
+
+  // Every open tab as of now: the rendered ones (renames included), plus any
+  // the last list returned that no render has shown yet, pending patches on top.
+  const openTabsNow = useCallback((): WorkspaceTab[] => {
+    const rendered = new Set(tabsRef.current.map((t) => t.id));
+    const fresh = listed.current.filter((t) => !rendered.has(t.id));
+    return applyPendingPatches([...tabsRef.current, ...fresh], pendingPatches.current);
+  }, []);
+
+  const openScript: WorkspaceTabsState['openScript'] = useCallback(
+    async (input) => {
+      const tab = await api.tabs.openScript({
+        ...input,
+        initialState: { title: nextScriptTitle(openTabsNow()), ...input.initialState },
+      });
+      await refresh();
+      return tab;
+    },
+    [refresh, openTabsNow],
+  );
+
+  const openServer: WorkspaceTabsState['openServer'] = useCallback(
+    async ({ connectionId, section }) => {
+      let tab = await api.tabs.openServer({ connectionId });
+      // Written through main rather than `patchServerState`: the tab is not in
+      // local state until the refresh below has rendered.
+      if (section && section !== tab.state.section) {
+        tab = (await api.tabs.update(tab.id, { state: { section } })) as ServerTab;
+      }
       await refresh();
       return tab;
     },
     [refresh],
   );
 
-  const openScript: WorkspaceTabsState['openScript'] = useCallback(
-    async (input) => {
-      const tab = await api.tabs.openScript(input);
-      await refresh();
-      return tab;
+  // W01 §14.8: renderer memory, newest first, capped. A ref for the list (a
+  // close and a reopen read it at call time) and a count for what draws.
+  const closedList = useRef<ClosedTab[]>([]);
+  const [closedCount, setClosedCount] = useState(0);
+  const setClosedList = useCallback((next: ClosedTab[]) => {
+    closedList.current = next;
+    setClosedCount(next.length);
+  }, []);
+  // Set below, once the opens it needs exist: `close`'s Undo calls it.
+  const reopenAndForget = useRef<(entry: ClosedTab) => Promise<boolean>>(() => Promise.resolve(false));
+
+  const noteClosed = useCallback(
+    (closing: WorkspaceTab) => {
+      forgetScroll(closing.id);
+      const entry = closedTabOf(closing);
+      setClosedList(pushClosed(closedList.current, entry));
+      return entry;
     },
-    [refresh],
+    [setClosedList],
   );
 
   const close = useCallback(
     async (id: string) => {
+      keepTab(id);
+      const closing = openTabsNow().find((t) => t.id === id);
       await api.tabs.close(id);
+      // Recorded the moment main has closed it, before the refresh: from here
+      // the renderer's copy of the source is the only one left.
+      const entry = closing ? noteClosed(closing) : null;
       await refresh();
+      // A script is the one thing a user writes freehand and cannot get back.
+      if (entry && entry.kind === 'script' && entry.state.source.trim() !== '') {
+        notify.info('Script tab closed', {
+          action: {
+            label: 'Undo',
+            onClick: () => {
+              void reopenAndForget.current(entry).catch((err) => notify.error(getErrorMessage(err, 'Could not reopen the script tab')));
+            },
+          },
+        });
+      }
     },
-    [refresh],
+    [refresh, keepTab, openTabsNow, noteClosed],
   );
 
   const closeForConnection = useCallback(async (connectionId: string) => {
@@ -329,12 +495,23 @@ export function useWorkspaceTabs(): WorkspaceTabsState {
     // tabs", where an emptiness check conflates them and re-fetches blind.
     const snapshot = tabsRef.current;
     const toClose = snapshot.filter((t) => t.connectionId === connectionId);
+    // With the edits the debounce has not flushed yet: that is the source to keep.
+    const latest = new Map(openTabsNow().map((t) => [t.id, t]));
     setTabs(snapshot.filter((t) => t.connectionId !== connectionId));
+    // A script with code is lost with its tab, so every tab main did close is
+    // recorded for ⌘⇧T (W01 §14.8), a failed close not being closed.
     await Promise.all(
-      toClose.map((t) => api.tabs.close(t.id).catch((err) => logFailure('closing a tab', err))),
+      toClose.map((t) =>
+        api.tabs.close(t.id).then(
+          () => {
+            noteClosed(latest.get(t.id) ?? t);
+          },
+          (err: unknown) => logFailure('closing a tab', err),
+        ),
+      ),
     );
     await refresh();
-  }, [refresh]);
+  }, [refresh, noteClosed, openTabsNow]);
 
   const closeForNamespace: WorkspaceTabsState['closeForNamespace'] = useCallback(
     async ({ connectionId, dbName, collection }) => {
@@ -359,7 +536,7 @@ export function useWorkspaceTabs(): WorkspaceTabsState {
         if (!proceed) return;
       }
       await Promise.all(
-        matches.map((t) => api.tabs.close(t.id).catch((err) => logFailure('closing a tab', err))),
+        matches.map((t) => api.tabs.close(t.id).then(() => forgetScroll(t.id)).catch((err) => logFailure('closing a tab', err))),
       );
       await refresh();
     },
@@ -428,6 +605,7 @@ export function useWorkspaceTabs(): WorkspaceTabsState {
   );
 
   const setPinned = useCallback(async (id: string, pinned: boolean) => {
+    keepTab(id);
     setTabs((ts) => {
       const updated = ts.map((t) => (t.id === id ? { ...t, pinned } : t));
       return [...updated].sort(
@@ -436,7 +614,7 @@ export function useWorkspaceTabs(): WorkspaceTabsState {
       );
     });
     await api.tabs.setPinned({ id, pinned });
-  }, []);
+  }, [keepTab]);
 
   const saveFailureShown = useRef(false);
   // Sends every pending patch now, dropping the debounce, and resolves once
@@ -491,8 +669,8 @@ export function useWorkspaceTabs(): WorkspaceTabsState {
     };
   }, [flushNow]);
 
-  const patchCollectionState = useCallback(
-    (id: string, patch: Partial<CollectionTabState>) => {
+  const applyCollectionPatch = useCallback(
+    (id: string, patch: Partial<CollectionTabState>, keep: boolean) => {
       const current = tabsRef.current.find((t) => t.id === id);
       if (!current || current.kind !== 'collection') return;
       if (
@@ -511,11 +689,17 @@ export function useWorkspaceTabs(): WorkspaceTabsState {
             : t,
         ),
       );
+      if (keep) keepTab(id);
       const existing = pendingPatches.current.get(id);
       pendingPatches.current.set(id, { ...(existing ?? {}), ...patch });
       scheduleFlush();
     },
-    [scheduleFlush],
+    [scheduleFlush, keepTab],
+  );
+
+  const patchCollectionState = useCallback(
+    (id: string, patch: Partial<CollectionTabState>) => applyCollectionPatch(id, patch, keepsPreview(patch)),
+    [applyCollectionPatch],
   );
 
   const patchCollectionStateWith: WorkspaceTabsState['patchCollectionStateWith'] = useCallback(
@@ -546,11 +730,12 @@ export function useWorkspaceTabs(): WorkspaceTabsState {
             : t,
         ),
       );
+      if (keepsPreview(patch)) keepTab(id);
       const existing = pendingPatches.current.get(id);
       pendingPatches.current.set(id, { ...(existing ?? {}), ...patch });
       scheduleFlush();
     },
-    [scheduleFlush],
+    [scheduleFlush, keepTab],
   );
 
   const setActiveView: WorkspaceTabsState['setActiveView'] = useCallback(
@@ -591,9 +776,10 @@ export function useWorkspaceTabs(): WorkspaceTabsState {
         return;
       }
       const merged: AggregationTabState = { ...base, ...patch };
-      patchCollectionState(id, { aggregation: merged });
+      // A run's output is the app's write; anything else is a pipeline edit.
+      applyCollectionPatch(id, { aggregation: merged }, Object.keys(patch).some((k) => k !== 'lastRun'));
     },
-    [patchCollectionState],
+    [applyCollectionPatch],
   );
 
   const patchScriptState: WorkspaceTabsState['patchScriptState'] = useCallback(
@@ -627,16 +813,94 @@ export function useWorkspaceTabs(): WorkspaceTabsState {
     [scheduleFlush],
   );
 
+  const patchServerState: WorkspaceTabsState['patchServerState'] = useCallback(
+    (id, patch) => {
+      const current = tabsRef.current.find((t) => t.id === id);
+      if (!current || current.kind !== 'server') return;
+      if (isNoOpPatch(current.state as unknown as Record<string, unknown>, patch as unknown as Partial<Record<string, unknown>>)) return;
+      setTabs((ts) => ts.map((t) => (t.id === id && t.kind === 'server' ? { ...t, state: { ...t.state, ...patch } } : t)));
+      const existing = pendingPatches.current.get(id) as Partial<ServerTabState> | undefined;
+      pendingPatches.current.set(id, { ...(existing ?? {}), ...patch } as unknown as Partial<CollectionTabState>);
+      scheduleFlush();
+    },
+    [scheduleFlush],
+  );
+
+  const reopen = useCallback(
+    async (entry: ClosedTab) => {
+      if (entry.kind === 'script') {
+        const tab = await openScript({ connectionId: entry.connectionId, initialState: entry.state });
+        if (entry.pinned) await setPinned(tab.id, true);
+        return;
+      }
+      if (entry.kind === 'server') {
+        const tab = await openServer({ connectionId: entry.connectionId, section: entry.state.section });
+        if (entry.pinned) await setPinned(tab.id, true);
+        return;
+      }
+      const tab = await openCollection({
+        connectionId: entry.connectionId,
+        dbName: entry.dbName,
+        collection: entry.collection,
+        reuseExisting: false,
+        initialState: entry.state,
+      });
+      if (entry.pinned) await setPinned(tab.id, true);
+    },
+    [openScript, openServer, openCollection, setPinned],
+  );
+
+  // An entry leaves the list only once its tab is open: a reopen that fails
+  // keeps the source for the next try. One at a time per entry, so a double
+  // ⌘⇧T or Undo clicked as well cannot open it twice; false when it is
+  // already being reopened or already back.
+  const reopening = useRef(new Set<ClosedTab>());
+  const reopenOne = useCallback(
+    async (entry: ClosedTab) => {
+      if (reopening.current.has(entry) || !closedList.current.includes(entry)) return false;
+      reopening.current.add(entry);
+      try {
+        await reopen(entry);
+        setClosedList(withoutClosed(closedList.current, entry));
+        return true;
+      } finally {
+        reopening.current.delete(entry);
+      }
+    },
+    [reopen, setClosedList],
+  );
+  useEffect(() => {
+    reopenAndForget.current = reopenOne;
+  }, [reopenOne]);
+
+  const reopenClosed = useCallback(
+    async (isLive: (connectionId: string) => boolean) => {
+      // Entries of a Connection that is gone are dropped here; the one taken
+      // stays listed until it is open.
+      const live = liveClosed(closedList.current, isLive);
+      setClosedList(live);
+      const entry = live.find((e) => !reopening.current.has(e));
+      if (!entry) return false;
+      return reopenOne(entry);
+    },
+    [setClosedList, reopenOne],
+  );
+
   return {
     tabs,
     activeId,
     loading,
     error,
     refresh,
+    previewId,
+    keepTab,
     openCollection,
     openAggregation,
     openScript,
+    openServer,
     close,
+    closedCount,
+    reopenClosed,
     closeForConnection,
     closeForNamespace,
     retargetCollection,
@@ -647,6 +911,7 @@ export function useWorkspaceTabs(): WorkspaceTabsState {
     patchCollectionState,
     patchCollectionStateWith,
     patchScriptState,
+    patchServerState,
     patchAggregationState,
   };
 }

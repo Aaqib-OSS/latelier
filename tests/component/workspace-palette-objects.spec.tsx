@@ -458,7 +458,7 @@ describe('Saved objects', () => {
   it('a saved Open into the same tab clears the complaint the replaced filter left', async () => {
     mount();
     await screen.findByTestId('nav-coll-shop-orders');
-    const field = screen.getByLabelText('Query filter');
+    const field = screen.getByLabelText('Filter', { selector: 'textarea' });
     fireEvent.change(field, { target: { value: '{ nope' } });
     fireEvent.blur(field);
     await waitFor(() => expect(screen.queryAllByRole('alert').length).toBeGreaterThan(0));
@@ -495,7 +495,9 @@ describe('Saved objects', () => {
 
     const field = (await screen.findByLabelText('New name for "Orders by region"')) as HTMLInputElement;
     expect(field.value).toBe('Orders by region');
-    expect(screen.getByRole('tab', { name: 'Saved', selected: true })).toBeTruthy();
+    // In the Filter Bar row's Saved popover, the list's only home.
+    expect(screen.getByRole('textbox', { name: 'Search saved queries' })).toBeTruthy();
+    expect(screen.queryByRole('tab', { name: 'Saved' })).toBeNull();
     fireEvent.change(field, { target: { value: 'Region totals' } });
     fireEvent.keyDown(field, { key: 'Enter' });
     await waitFor(() => expect(m.savedUpdate).toHaveBeenCalledWith({ id: 'q2', patch: { name: 'Region totals' } }));
@@ -541,7 +543,7 @@ describe('Database objects and the collections of every connected Connection', (
   it('a database’s Enter reveals it in a collapsed navigator: expanded, its row focused', async () => {
     const m = mount();
     await listBoth(m);
-    fireEvent.click(screen.getByRole('button', { name: 'Collapse navigator' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Toggle sidebar' }));
     await waitFor(() => expect(screen.queryByRole('tree')).toBeNull());
     openPalette();
     search('ordering');
@@ -656,7 +658,9 @@ describe('the added commands’ gates', () => {
     search('Explain query');
     await waitFor(() => expect(titles()[0]).toEqual(['Explain query', '']));
     fireEvent.keyDown(input(), { key: 'Enter' });
-    expect(await screen.findByRole('dialog', { name: /plan|explain/i })).toBeTruthy();
+    // The Inspector's Plan tab, not a dialog (W05 §9.7).
+    expect(await screen.findByRole('tab', { name: 'Plan' })).toBeTruthy();
+    await waitFor(() => expect(screen.getByRole('tab', { name: 'Plan' }).getAttribute('aria-selected')).toBe('true'));
   });
 
   it('New script tab is greyed with a reason when no Connection can be named', async () => {

@@ -6,7 +6,6 @@ import {
   Menu,
   VisuallyHidden,
   Select,
-  Tabs,
   TextInput,
   Tooltip,
 } from '@mantine/core';
@@ -14,14 +13,9 @@ import { confirmDestructive } from '../../utils/confirm';
 import { filledFills } from '../../theme/mantineTheme';
 import { themeVars } from '../../theme/themeVars';
 import { I } from '../../icons';
-import { copyToClipboard } from '../../utils/clipboard';
 import { notify } from '../../theme/notifications';
 import {
   emptyBuilder,
-  compileFindOptions,
-  effectivePageLimit,
-  findProblem,
-  requireFilterJson,
   FIELD_OPS,
   DRAGGED_FIELD_MIME,
   condFromDragged,
@@ -55,9 +49,6 @@ import {
 import { initHistory, pushHistory, undo, redo, canUndo, canRedo, type History } from './filterHistory';
 import { clearFilterStep, peekFilterStep } from './filterStep';
 import { peekFilterRequest, subscribeTabRequests, takeFilterRequest } from './tabRequest';
-import { SavedTab } from './views/SavedTab';
-import { RecentTab } from './views/RecentTab';
-import { hydrateFindPayload, type LegacySavedFindPayload } from './legacyBuilder';
 import { useSuggestions } from '../../features/fieldSuggestions/useSuggestions';
 import { SuggestionPopover } from '../../features/fieldSuggestions/SuggestionPopover';
 import { DEFAULT_FIELD_SOURCES, fieldOperatorSource } from '../../features/fieldSuggestions/sources';
@@ -66,39 +57,32 @@ import { OperatorTooltip } from '../../features/fieldSuggestions/OperatorTooltip
 import type { SuggestionContext } from '../../features/fieldSuggestions/types';
 import type {
   BuilderState,
-  BuilderTab,
   CollectionTabState,
   FilterNode,
-  RecentQuery,
-  SavedQuery,
-  SavedQuerySummary,
   Stage,
   ValType,
 } from '@shared/types';
 import { useCollectionWorkspace } from './context';
+import { liveValidity } from '../../utils/shellSyntax';
 import { useLiveMatchCount } from './useLiveMatchCount';
 import { CondValueEditor } from './CondValueEditor';
 import { useStructureEntries } from './useStructureEntries';
 import { condTypeWarning } from './condValue';
 import { FILTER_TEMPLATES, type FilterTemplate } from './filterTemplates';
 import { builderToStages } from './builderToPipeline';
-import { CODE_LANGS, findCode, type CodeLang } from '../../utils/driverCode';
+import { CODE_LANGS, type CodeLang } from '../../utils/driverCode';
+import { copyQueryAsCode } from './copyQueryCode';
 
 interface BuilderPaneProps {
-  /** Bumped externally after a save so SavedTab re-fetches. */
-  savedRefreshKey: number;
-  /** Opens an aggregation or script saved item as its own top-level tab. */
-  onOpenInTab: (saved: SavedQuerySummary) => void;
-  /** Called once the Saved list has renamed one of its entries. */
-  onSavedRenamed: (saved: SavedQuerySummary, name: string) => void;
   /** Opens this query, as stages, in the collection's Aggregation view. */
   onOpenAsPipeline: (stages: Stage[]) => void;
   /**
-   * Counts the loads that replaced the query wholesale — Reset, Saved and
-   * Recent run-here. Owned by the parent so QueryBar sees the same count.
+   * Counts the loads that replaced the query wholesale — Reset here, a Saved
+   * or History load from the Filter Bar row. Owned by the parent, which
+   * counts both.
    */
   loadGen: number;
-  /** Called after each of those loads, alongside its patch. */
+  /** Called after a Reset, alongside its patch. */
   onLoaded: () => void;
 }
 
@@ -682,6 +666,8 @@ function CondRow({
    */
   const handleOpKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Escape') {
+      // Consumed: the Inspector around the builder closes on an Escape nobody took.
+      e.preventDefault();
       revertOpDraft();
       opInputRef.current?.blur();
       return;
@@ -2002,9 +1988,6 @@ function FilterDrawer({ queryRaw, filterDraft, onCommit, suggestionContext }: Fi
 }
 
 function BuilderPaneInner({
-  savedRefreshKey,
-  onOpenInTab,
-  onSavedRenamed,
   onOpenAsPipeline,
   loadGen,
   onLoaded,
@@ -2013,7 +1996,6 @@ function BuilderPaneInner({
   const { state, actions, meta } = useCollectionWorkspace();
   const { connectionId, dbName, collection } = meta;
   const onPatch = actions.patch;
-  const onRun = actions.run;
 
   // `loadGen` is bumped on Reset / Saved-run / Recent-run — the external-edit
   // triggers of §5.3 that may (coincidentally) write the same `queryRaw` text
@@ -2022,7 +2004,12 @@ function BuilderPaneInner({
   // these always force a fresh seed + drop any pending rows, the same as a
   // genuine text change would.
 
-  const activeTab = state.activeBuilderTab;
+  // X14 §11 — the drawer reads the bar's text as the Shell Syntax transform
+  // would leave it. Uncommitted `{status: 'shipped'}` is a filter the app
+  // runs, so the tree shows its conditions instead of freezing on the last
+  // valid one; text the transform refuses still freezes it. The repair
+  // commits on blur, to this same text, so the drawer sees no second change.
+  const liveQueryRaw = React.useMemo(() => liveValidity(state.queryRaw).text, [state.queryRaw]);
 
   const suggestionContext = React.useMemo<SuggestionContext | null>(() => {
     if (!connectionId || !dbName || !collection) return null;
@@ -2034,74 +2021,7 @@ function BuilderPaneInner({
     };
   }, [connectionId, dbName, collection, state.lastRun?.documents]);
 
-  const setActiveTab = (tab: BuilderTab) => {
-    onPatch({ activeBuilderTab: tab });
-  };
-
-  // Reproduces the query as actually run, not the user's raw inputs: same
-  // skip/limit split `useQueryRunner` computes from the page
-  // (`effectivePageLimit`), same projection and sort it hands to
-  // `api.query.find` — so the copied command matches the page on screen.
-  const handleCopyCode = (lang: CodeLang) => {
-    // Refused through the same `findProblem` the Run button gates on: one
-    // rule for "is this query runnable", not a copy-path opinion beside it.
-    // An unparseable filter, sort, or raw projection copies nothing rather
-    // than verbatim text that won't run — the notification names the
-    // clause rather than saying the copy failed, since the clipboard is
-    // working fine; the query is not.
-    const problem = findProblem(state);
-    if (problem) {
-      notify.error(`Nothing copied — ${problem}`);
-      return;
-    }
-    const opts = compileFindOptions(state.builder);
-    const { skip, limit } = effectivePageLimit(opts.limit, state.page, state.pageSize);
-    // A `limit` of 0 means the page is past the user's cap and the runner
-    // short-circuits to an empty result (`useQueryRunner.ts:143`) — there is
-    // no `find` that reproduces that, so there is nothing to copy.
-    //
-    // A `.limit(0)` reads to the driver as "no limit", not zero — so
-    // emitting one here to represent an exhausted page would paste an
-    // *unbounded* cursor while the app itself shows zero rows: a
-    // full-collection scan hiding behind code that looks like it matches
-    // the screen. Refused, like every other unrunnable state above it,
-    // rather than emitted with an explanatory comment attached — a comment
-    // does not disarm the expression in front of it.
-    if (limit <= 0) {
-      notify.error(
-        'Nothing copied — this page is past the limit, so the query returns no documents.',
-      );
-      return;
-    }
-    // `findProblem` passing means every clause is already strict JSON — the
-    // filter once trimmed of the Unicode spaces the gate allows around it,
-    // which `requireFilterJson` does — so there is no Shell Syntax left to
-    // repair here. Canonical EJSON is still
-    // not shell syntax (`{"$oid": …}` pasted into mongosh is an unknown
-    // operator): `findCode` routes such a document through EJSON.parse.
-    //
-    // A clause the gates above let through but `findCode` cannot write is a
-    // bug in one of the two; from a menu click it would otherwise surface as
-    // an uncaught page error with nothing copied and nothing said.
-    const filter = requireFilterJson(state);
-    let code: string;
-    try {
-      code = findCode(lang, {
-        collection,
-        filter,
-        projection: opts.projection,
-        sort: opts.sort,
-        collation: opts.collation,
-        hint: opts.hint,
-        skip,
-        limit,
-      });
-    } catch (err) {
-      notify.error(`Nothing copied — ${err instanceof Error ? err.message : String(err)}`);
-      return;
-    }
-    void copyToClipboard(code, 'Command copied to the clipboard');
-  };
+  const handleCopyCode = (lang: CodeLang) => copyQueryAsCode(lang, state, collection);
 
   const handleOpenAsPipeline = () => {
     const result = builderToStages(state);
@@ -2144,25 +2064,6 @@ function BuilderPaneInner({
     });
   };
 
-  const handleSavedRunHere = (saved: SavedQuery) => {
-    if (saved.payload.kind === 'find') {
-      const patch = hydrateFindPayload(saved.payload as unknown as LegacySavedFindPayload, state.builder);
-      // The draft belongs to the filter being replaced: drop it with it.
-      onPatch({ ...patch, filterDraft: undefined });
-      onRun(patch);
-      onLoaded();
-    }
-  };
-
-  const handleRecentRunHere = (recent: RecentQuery) => {
-    if (recent.payload.kind === 'find') {
-      const patch = hydrateFindPayload(recent.payload as unknown as LegacySavedFindPayload, state.builder);
-      onPatch({ ...patch, filterDraft: undefined });
-      onRun(patch);
-      onLoaded();
-    }
-  };
-
   return (
     <div
       data-testid="builder-pane"
@@ -2177,118 +2078,61 @@ function BuilderPaneInner({
         position: 'relative',
       }}
     >
-      {/* This was three bare <button>s with an accent bottom-border on the
-          active one: no role, no aria-selected, no
-          aria-controls, three separate tab stops. Mantine's Tabs is the
-          tablist pattern already built, so the drawer inherits all of it
-          (including arrow-key roving as a single tab stop) rather than
-          hand-rolling a fourth copy.
-
-          `keepMounted={false}` is load-bearing: Mantine's default keeps
-          inactive panels in the DOM, which would fire Saved's and Recent's
-          list IPC from the Filter tab and leave the Filter footer mounted
-          behind the other two. */}
-      <Tabs
-        value={activeTab}
-        onChange={(v) => { if (v) setActiveTab(v as BuilderTab); }}
-        keepMounted={false}
-        variant="default"
+      {/* The Inspector's Filter tab (W05 §9.7): its header and tab switch are
+          the Inspector's, so this pane is the body and the footer only. */}
+      <div
         style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}
       >
-        {/* 42px matches CollectionHeader height so the bottom border aligns */}
-        <Tabs.List
-          grow
-          aria-label="Query drawer"
-          style={{ flexShrink: 0, height: 42, borderBottom: `1px solid ${T.border}` }}
+        <FilterDrawer
+          key={`${meta.tabId}:${loadGen}`}
+          queryRaw={liveQueryRaw}
+          filterDraft={state.filterDraft}
+          onCommit={onPatch}
+          suggestionContext={suggestionContext}
+        />
+
+        {/* Pinned bottom row: Reset / Copy code / Open as pipeline, three
+            actions on the whole query. Save lived here too until the QueryBar
+            toolbar Save (always visible, next to Run/History) made this one a
+            duplicate; `saved.create`'s hint anchor moved with it. `SavedStrip`,
+            a preview of the Saved tab one click away, is gone for the same
+            reason.
+
+            Each button keeps its natural width and the row wraps, so the
+            height depends on the pane's width alone and no label clips. */}
+        <div
+          style={{
+            display: 'flex',
+            flexWrap: 'wrap',
+            gap: themeVars.gapXs,
+            boxSizing: 'border-box',
+            padding: '10px',
+            borderTop: `1px solid ${T.border}`,
+            flexShrink: 0,
+          }}
         >
-          {(['Builder', 'Saved', 'Recent'] as BuilderTab[]).map((tab) => (
-            <Tabs.Tab key={tab} value={tab} styles={{ tab: { fontSize: T.fsXs } }}>
-              {/* W13 §6 — the first tab's label is "Filter"; `tab` (the
-                  BuilderTab value 'Builder') is unchanged so persisted tab
-                  state / other call sites keep working. */}
-              {tab === 'Builder' ? 'Filter' : tab}
-            </Tabs.Tab>
-          ))}
-        </Tabs.List>
-
-        <Tabs.Panel
-          value="Builder"
-          style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}
-        >
-          <FilterDrawer
-            key={`${meta.tabId}:${loadGen}`}
-            queryRaw={state.queryRaw}
-            filterDraft={state.filterDraft}
-            onCommit={onPatch}
-            suggestionContext={suggestionContext}
-          />
-
-          {/* Pinned bottom row: Reset / Copy code / Open as pipeline, three
-              actions on the whole query. Save lived here too until the QueryBar
-              toolbar Save (always visible, next to Run/History) made this one a
-              duplicate; `saved.create`'s hint anchor moved with it. `SavedStrip`,
-              a preview of the Saved tab one click away, is gone for the same
-              reason.
-
-              Each button keeps its natural width and the row wraps, so the
-              height depends on the pane's width alone and no label clips. */}
-          <div
-            style={{
-              display: 'flex',
-              flexWrap: 'wrap',
-              gap: themeVars.gapXs,
-              boxSizing: 'border-box',
-              padding: '10px',
-              borderTop: `1px solid ${T.border}`,
-              flexShrink: 0,
-            }}
-          >
-            <Button variant="default" size="compact-xs" onClick={handleReset}>
-              Reset
-            </Button>
-            <Menu position="top-start" shadow="md">
-              <Menu.Target>
-                <Button variant="default" size="compact-xs" rightSection={I.chevD}>
-                  Copy code
-                </Button>
-              </Menu.Target>
-              <Menu.Dropdown>
-                {CODE_LANGS.map(({ lang, label }) => (
-                  <Menu.Item key={lang} onClick={() => handleCopyCode(lang)}>
-                    {label}
-                  </Menu.Item>
-                ))}
-              </Menu.Dropdown>
-            </Menu>
-            <Button variant="default" size="compact-xs" onClick={handleOpenAsPipeline}>
-              Open as pipeline
-            </Button>
-          </div>
-        </Tabs.Panel>
-
-        <Tabs.Panel value="Saved" style={{ flex: 1, minHeight: 0, overflowY: 'auto' }}>
-          <SavedTab
-            connectionId={connectionId}
-            dbName={dbName}
-            collection={collection}
-            refreshKey={savedRefreshKey}
-            onRunHere={handleSavedRunHere}
-            onOpenInTab={onOpenInTab}
-            tabId={meta.tabId}
-            onRenamed={onSavedRenamed}
-          />
-        </Tabs.Panel>
-
-        <Tabs.Panel value="Recent" style={{ flex: 1, minHeight: 0, overflowY: 'auto' }}>
-          <RecentTab
-            connectionId={connectionId}
-            dbName={dbName}
-            collection={collection}
-            onRunHere={handleRecentRunHere}
-          />
-        </Tabs.Panel>
-      </Tabs>
-
+          <Button variant="default" size="compact-xs" onClick={handleReset}>
+            Reset
+          </Button>
+          <Menu position="top-start" shadow="md">
+            <Menu.Target>
+              <Button variant="default" size="compact-xs" rightSection={I.chevD}>
+                Copy code
+              </Button>
+            </Menu.Target>
+            <Menu.Dropdown>
+              {CODE_LANGS.map(({ lang, label }) => (
+                <Menu.Item key={lang} onClick={() => handleCopyCode(lang)}>
+                  {label}
+                </Menu.Item>
+              ))}
+            </Menu.Dropdown>
+          </Menu>
+          <Button variant="default" size="compact-xs" onClick={handleOpenAsPipeline}>
+            Open as pipeline
+          </Button>
+        </div>
+      </div>
     </div>
   );
 }

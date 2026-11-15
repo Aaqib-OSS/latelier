@@ -20,6 +20,7 @@ import { DocumentEditor } from './DocumentEditor';
 import { DeleteConfirm } from './DeleteConfirm';
 import { UpdateConfirm } from './UpdateConfirm';
 import { resolveDeleteDialog } from './deleteMode';
+import { isConnectionActive } from '../../state/connections';
 import { currentFilterJson } from './builder';
 import type { ReferenceDrawerState } from './useReferenceDrawer';
 import { targetOf, type useDocumentDialogs } from './useDocumentDialogs';
@@ -191,7 +192,7 @@ export function NewTabPicker({ connectionId, onCancel, onPick }: NewTabPickerPro
             >
               <option value="documents">Documents</option>
               <option value="aggregation">Aggregation</option>
-              <option value="structure">Structure</option>
+              <option value="structure">Schema &amp; indexes</option>
             </select>
           </label>
         </div>
@@ -233,8 +234,6 @@ export interface DialogStackProps {
   queryBarSaveOpen: boolean;
   setQueryBarSaveOpen: (open: boolean) => void;
   setSavedRefreshKey: React.Dispatch<React.SetStateAction<number>>;
-  expandBuilder: () => void;
-  patchActiveCollection: (patch: Record<string, unknown>) => void;
   refsConfigureHint: UseFeatureHintResult;
   tabsPinHint: UseFeatureHintResult;
   savedCreateHint: UseFeatureHintResult;
@@ -257,8 +256,6 @@ export function DialogStack({
   queryBarSaveOpen,
   setQueryBarSaveOpen,
   setSavedRefreshKey,
-  expandBuilder,
-  patchActiveCollection,
   refsConfigureHint,
   tabsPinHint,
   savedCreateHint,
@@ -300,6 +297,7 @@ export function DialogStack({
     manageFromExpandedTable,
     editFromExpandedTable,
     deleteFromExpandedTable,
+    disconnectFromExpandedTable,
     addFromExpandedTable,
     importFromExpandedTable,
     tabCountFor,
@@ -350,8 +348,6 @@ export function DialogStack({
           onSaved={() => {
             setSavedRefreshKey((k) => k + 1);
             setQueryBarSaveOpen(false);
-            expandBuilder();
-            patchActiveCollection({ activeBuilderTab: 'Saved' });
           }}
         />
       )}
@@ -388,6 +384,7 @@ export function DialogStack({
           collection={editing.target.collection}
           doc={editing.doc}
           focusPath={editing.focusPath}
+          siblings={editing.siblings}
           onClose={closeEditor}
           onSaved={handleDocSaved}
         />
@@ -435,6 +432,9 @@ export function DialogStack({
             readOnly={focusedConnectionReadOnly}
             docs={dialog.docs}
             filter={dialog.filter}
+            source={dialog.source}
+            connectionName={connections.find((c) => c.id === activeCollection.connectionId)?.name ?? activeCollection.connectionId}
+            nameConnection={connections.filter((c) => isConnectionActive(c.status)).length > 1}
             // Only when the dialog deletes by the tab's own filter. A
             // selection deletes the selected documents by `_id`, the same set
             // with or without the collation or hint, and DeleteConfirm refuses
@@ -495,6 +495,8 @@ export function DialogStack({
         <ConnectionDisconnectDialog
           name={disconnectTarget.name}
           tabCount={disconnectTarget.tabCount}
+          unsavedScripts={disconnectTarget.unsavedScripts}
+          scriptsReopenable
           onCancel={closeDisconnectConnectionModal}
           onConfirm={confirmDisconnectConnection}
           returnFocusTo={disconnectReturnFocus}
@@ -515,6 +517,7 @@ export function DialogStack({
           onDeleteMany={deleteConnections}
           onEdit={editFromExpandedTable}
           onDelete={deleteFromExpandedTable}
+          onDisconnect={disconnectFromExpandedTable}
         />
       )}
     </>

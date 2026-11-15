@@ -1,5 +1,6 @@
 import React from 'react';
-import { ActionIcon, Button, Tooltip } from '@mantine/core';
+import { ActionIcon, Button, Tooltip, VisuallyHidden } from '@mantine/core';
+import { IconDots } from '@tabler/icons-react';
 import {
   List,
   useDynamicRowHeight,
@@ -9,11 +10,11 @@ import {
 } from 'react-window';
 import type { CollectionInfo, DbInfo } from '@shared/ipc';
 import type { ConnectionSummary, ProbeErrorCode } from '@shared/types';
-import { api, getErrorMessage } from '../../api/atelier';
+import { api } from '../../api/atelier';
 import { logFailure } from '../../utils/rendererLog';
-import { notify } from '../../theme/notifications';
 import { copyToClipboard } from '../../utils/clipboard';
 import { disconnectConnection } from '../../features/connections/disconnectConnection';
+import { copyConnectionString } from '../../features/connections/connectionRowMenu';
 import { isKnownNotConnected } from '../../state/connections';
 import { I } from '../../icons';
 import { themeVars } from '../../theme/themeVars';
@@ -48,10 +49,21 @@ export interface NavigatorOpenInput {
   collection: string;
 }
 
-/** A row to reveal: a collection, or a database on its own. */
+const ROW_HEIGHT = 28;
+
+const collectionKey = (connectionId: string, dbName: string, collection: string) =>
+  JSON.stringify([connectionId, dbName, collection]);
+
+/** `2 databases`, `1 collection`: what the bare digit beside a row counts. */
+const countText = (n: number, noun: string) => `${n} ${noun}${n === 1 ? '' : 's'}`;
+
+/** Past the 10 ms Mantine waits before it returns focus to a closed dialog's opener. */
+const TREE_FOCUS_DELAY_MS = 60;
+
+/** A row to reveal: a collection, a database on its own, or a Connection's root (no `dbName`). */
 export interface NavigatorRevealInput {
   connectionId: string;
-  dbName: string;
+  dbName?: string;
   collection?: string;
 }
 
@@ -67,7 +79,8 @@ export interface DbCollectionNavigatorProps {
   width?: number;
   onOpenCollection: (
     input: NavigatorOpenInput,
-    opts: { reuseExisting: boolean },
+    /** `preview`: a single click, which opens the preview tab (W01 §14.9). */
+    opts: { reuseExisting: boolean; preview?: boolean },
   ) => void;
   onOpenAggregation: (input: NavigatorOpenInput) => void;
   /** `returnFocusTo`: the row to refocus, since the menu item that opened the form unmounts first. */
@@ -78,6 +91,12 @@ export interface DbCollectionNavigatorProps {
   ) => void;
   /** Real Disconnect (not "Cancel connecting"); caller owns confirming and closing tabs. */
   onDisconnect?: (connectionId: string, returnFocusTo?: HTMLElement | null) => void;
+  /** Collections with an open tab; the ones that are not the Focused Tab's carry a dot. */
+  openCollections?: readonly NavigatorOpenInput[];
+  /** Opens a Connection's server overview, from the root's `Server` control and its menu. */
+  onOpenServer?: (connectionId: string) => void;
+  /** Opens the connection form, from the footer's `+ Add connection`. */
+  onAddConnection?: () => void;
   /** Fired after a collection/view drop, so the caller can close any tab still pointing at it. */
   onCollectionDropped?: (connectionId: string, dbName: string, collection: string) => void;
   /** Fired after a database drop; every open tab on it should close. */
@@ -154,7 +173,10 @@ type TreeRow =
       connectionId: string;
       dbName: string;
       coll: CollectionInfo;
+      /** The Focused Tab's collection: the one filled row. */
       isActive: boolean;
+      /** Open in a tab that is not the Focused Tab: a dot. */
+      hasOpenTab: boolean;
     }
   | { kind: 'skeleton'; id: string; dbName: string }
   | { kind: 'coll-empty'; id: string; dbName: string }
@@ -267,6 +289,9 @@ export function DbCollectionNavigator({
   onOpenAggregation,
   onEditConnection,
   onDisconnect,
+  openCollections,
+  onOpenServer,
+  onAddConnection,
   onCollectionDropped,
   onDatabaseDropped,
   onCollectionRenamed,
@@ -285,6 +310,13 @@ export function DbCollectionNavigator({
   const { caches, connectErrors, expandedConnId, expanded } = tree;
   const [filter, setFilter] = React.useState('');
   const [focusedId, setFocusedId] = React.useState<string | null>(null);
+  // The focus ring is drawn only while the tree holds the keyboard: a ring
+  // left on a row after focus moved to a tab read as a third selection style.
+  const [treeFocused, setTreeFocused] = React.useState(false);
+  const openKeys = React.useMemo(
+    () => new Set((openCollections ?? []).map((c) => collectionKey(c.connectionId, c.dbName, c.collection))),
+    [openCollections],
+  );
   // Sticky-header trick: overflow:hidden on the container, overflow:auto only on the tree region.
   const treeRef = React.useRef<HTMLDivElement | null>(null);
   const expandedRef = React.useRef(expanded);
@@ -730,6 +762,7 @@ export function DbCollectionNavigator({
               conn.id === focusedConnectionId &&
               db.name === activeDbName &&
               c.name === activeCollection,
+            hasOpenTab: openKeys.has(collectionKey(conn.id, db.name, c.name)),
           });
         }
       }
@@ -756,6 +789,7 @@ export function DbCollectionNavigator({
     filterLower,
     activeDbName,
     activeCollection,
+    openKeys,
   ]);
 
   const listRef = useListRef(null);
@@ -768,13 +802,36 @@ export function DbCollectionNavigator({
   // already in flight): once that settles without the collection — dropped, or
   // the listing failed — the request is spent, so it never fires later.
   const pendingRevealRef = React.useRef<{ req: NavigatorRevealInput; listed: boolean } | null>(null);
+  // A Connection's root is revealed to be used with the keyboard, so the tree
+  // takes focus. The palette that asked for it is still closing: Mantine's
+  // focus return runs 10 ms after, and answers to whatever holds focus then.
+  // Waiting it out leaves the tree the last to ask, whichever came first.
+  const focusTimerRef = React.useRef<number | null>(null);
+  const focusTreeSoon = React.useCallback(() => {
+    if (focusTimerRef.current !== null) window.clearTimeout(focusTimerRef.current);
+    focusTimerRef.current = window.setTimeout(() => {
+      focusTimerRef.current = null;
+      // A dialog that opened meanwhile keeps the keyboard.
+      if (document.activeElement?.closest('[role="dialog"], [role="alertdialog"]')) return;
+      treeRef.current?.focus();
+    }, TREE_FOCUS_DELAY_MS);
+  }, []);
+  React.useEffect(
+    () => () => {
+      if (focusTimerRef.current !== null) window.clearTimeout(focusTimerRef.current);
+    },
+    [],
+  );
   const [revealListed, setRevealListed] = React.useState(0);
   React.useEffect(() => {
     if (!revealRequest) return;
-    const pending = { req: revealRequest, listed: false };
+    const { dbName } = revealRequest;
+    // A root needs no listing: it is drawn once the Connection is.
+    const pending = { req: revealRequest, listed: dbName === undefined };
     pendingRevealRef.current = pending;
     queueMicrotask(() => setFilter(''));
-    void loadColls(revealRequest.connectionId, revealRequest.dbName).then(() => {
+    if (dbName === undefined) return;
+    void loadColls(revealRequest.connectionId, dbName).then(() => {
       pending.listed = true;
       setRevealListed((n) => n + 1);
     });
@@ -783,10 +840,13 @@ export function DbCollectionNavigator({
     const pending = pendingRevealRef.current;
     if (!pending) return;
     const { req } = pending;
+    const { dbName } = req;
     const id =
-      req.collection === undefined
-        ? `db:${req.connectionId}:${req.dbName}`
-        : `coll:${req.connectionId}:${req.dbName}:${req.collection}`;
+      dbName === undefined
+        ? `conn:${req.connectionId}`
+        : req.collection === undefined
+        ? `db:${req.connectionId}:${dbName}`
+        : `coll:${req.connectionId}:${dbName}:${req.collection}`;
     const idx = rows.findIndex((r) => r.id === id);
     if (idx >= 0) {
       pendingRevealRef.current = null;
@@ -795,19 +855,22 @@ export function DbCollectionNavigator({
       listRef.current?.scrollToRow({ index: idx, align: 'auto' });
       queueMicrotask(() => {
         setFocusedId(id);
+        if (dbName === undefined) focusTreeSoon();
         onRevealHandled?.();
       });
       return;
     }
+    // A root that is not drawn yet is waited for; it is never "gone" like a listed row.
+    if (dbName === undefined) return;
     const c = ownGet(caches, req.connectionId);
-    if (!pending.listed || ownGet(c?.collsLoading ?? {}, req.dbName)) return;
+    if (!pending.listed || ownGet(c?.collsLoading ?? {}, dbName)) return;
     // A database's own row is drawn from its listing already: absent once its
     // collections are in, it is gone.
-    if (req.collection !== undefined && ownGet(c?.colls ?? {}, req.dbName)?.some((x) => x.name === req.collection)) return;
+    if (req.collection !== undefined && ownGet(c?.colls ?? {}, dbName)?.some((x) => x.name === req.collection)) return;
     pendingRevealRef.current = null;
     queueMicrotask(() => onRevealHandled?.());
-  }, [rows, revealListed, onRevealHandled, caches, listRef]);
-  const rowHeight = useDynamicRowHeight({ defaultRowHeight: 26 });
+  }, [rows, revealListed, onRevealHandled, caches, listRef, focusTreeSoon]);
+  const rowHeight = useDynamicRowHeight({ defaultRowHeight: ROW_HEIGHT });
 
   React.useEffect(() => {
     const activeId =
@@ -837,7 +900,7 @@ export function DbCollectionNavigator({
   const openFromRow = React.useCallback(
     (
       row: Extract<TreeRow, { kind: 'coll' }>,
-      opts: { newTab?: boolean; aggregation?: boolean },
+      opts: { newTab?: boolean; aggregation?: boolean; preview?: boolean },
     ) => {
       const input: NavigatorOpenInput = {
         connectionId: row.connectionId,
@@ -847,7 +910,7 @@ export function DbCollectionNavigator({
       if (opts.aggregation) {
         onOpenAggregation(input);
       } else {
-        onOpenCollection(input, { reuseExisting: !opts.newTab });
+        onOpenCollection(input, { reuseExisting: !opts.newTab, preview: opts.preview });
       }
     },
     [onOpenCollection, onOpenAggregation],
@@ -863,7 +926,10 @@ export function DbCollectionNavigator({
       openFromRow(row, { aggregation: true });
       return;
     }
-    openFromRow(row, { newTab: e.metaKey || e.ctrlKey });
+    const newTab = e.metaKey || e.ctrlKey;
+    // A single click previews; the second click of a double-click (detail 2)
+    // keeps the tab the first one opened, as does ⌘-click's new tab.
+    openFromRow(row, { newTab, preview: !newTab && e.detail < 2 });
   }, [openFromRow]);
 
   const onKeyDown = (e: React.KeyboardEvent) => {
@@ -1101,6 +1167,14 @@ export function DbCollectionNavigator({
     const items: MenuItem[] = [
       {
         kind: 'item',
+        label: 'Server overview',
+        icon: I.server,
+        onClick: () => onOpenServer?.(id),
+        disabled: !onOpenServer,
+        disabledTitle: 'Server overview not available',
+      },
+      {
+        kind: 'item',
         label: 'Refresh databases',
         icon: I.sync,
         onClick: () => void refreshAll(id),
@@ -1119,12 +1193,7 @@ export function DbCollectionNavigator({
         kind: 'item',
         label: 'Copy connection string',
         icon: I.copy,
-        // Main builds the URI without the saved password, so none reaches the clipboard.
-        onClick: () =>
-          void api.conn
-            .getUri(id)
-            .then(({ uri }) => copyToClipboard(uri, 'Connection string copied — password not included.'))
-            .catch((e: unknown) => notify.error(getErrorMessage(e, 'Could not build the connection string'))),
+        onClick: () => copyConnectionString(id),
       },
       { kind: 'sep' },
     ];
@@ -1155,7 +1224,7 @@ export function DbCollectionNavigator({
       });
     }
     return items;
-  }, [refreshAll, onEditConnection, onDisconnect, disconnect, reconnect]);
+  }, [refreshAll, onEditConnection, onOpenServer, onDisconnect, disconnect, reconnect]);
 
   // #55/#69 — shared by the mouse (`onRowContextMenu`) and keyboard
   // (Shift+F10 / ContextMenu key, in `onKeyDown` above) open paths; only the
@@ -1224,13 +1293,14 @@ export function DbCollectionNavigator({
   const rowProps = React.useMemo<NavRowProps>(
     () => ({
       rows,
-      focusedId,
+      focusedId: treeFocused ? focusedId : null,
       focusedConnectionId,
       activeDbName,
       isConnected,
       subtreeSpine,
       spineFor,
       T,
+      onOpenServer,
       setFocusedId,
       clearFilter: () => setFilter(''),
       toggleConnection,
@@ -1247,12 +1317,14 @@ export function DbCollectionNavigator({
     [
       rows,
       focusedId,
+      treeFocused,
       focusedConnectionId,
       activeDbName,
       isConnected,
       subtreeSpine,
       spineFor,
       T,
+      onOpenServer,
       toggleConnection,
       toggleDb,
       refreshDb,
@@ -1311,9 +1383,16 @@ export function DbCollectionNavigator({
           {I.search}
           <input
             aria-label="Filter collections"
-            placeholder="Filter…"
+            placeholder="Filter collections"
             value={filter}
             onChange={(e) => setFilter(e.target.value)}
+            // Escape clears what was typed; a second one, on an empty filter, leaves the field.
+            onKeyDown={(e) => {
+              if (e.key !== 'Escape') return;
+              e.stopPropagation();
+              if (filter !== '') setFilter('');
+              else e.currentTarget.blur();
+            }}
             style={{
               flex: 1,
               background: 'transparent',
@@ -1351,6 +1430,10 @@ export function DbCollectionNavigator({
         aria-label="Databases and collections"
         aria-activedescendant={activeDescendantId}
         onKeyDown={onKeyDown}
+        onFocus={() => setTreeFocused(true)}
+        onBlur={(e) => {
+          if (!e.currentTarget.contains(e.relatedTarget)) setTreeFocused(false);
+        }}
         style={{
           flex: 1,
           minHeight: 0,
@@ -1381,6 +1464,23 @@ export function DbCollectionNavigator({
         )}
 
       </div>
+
+      {onAddConnection && (
+        <div
+          style={{
+            height: 32,
+            flexShrink: 0,
+            display: 'flex',
+            alignItems: 'center',
+            padding: '0 6px',
+            borderTop: `1px solid ${T.border}`,
+          }}
+        >
+          <Button type="button" variant="subtle" color="gray" size="compact-xs" fz={T.fsSm} onClick={onAddConnection}>
+            + Add connection
+          </Button>
+        </div>
+      )}
 
       {menu && <ContextMenu menu={menu} onClose={closeMenu} />}
 
@@ -1453,6 +1553,7 @@ export function DbCollectionNavigator({
           onClose={closeImport}
           onImported={handleImported}
           onPartialImport={handleImported}
+          onUndone={handleImported}
         />
       )}
 
@@ -1479,6 +1580,7 @@ interface NavRowProps {
   subtreeSpine: string;
   spineFor: (conn: ConnectionSummary) => string;
   T: Theme;
+  onOpenServer?: (connectionId: string) => void;
   setFocusedId: (id: string | null) => void;
   toggleConnection: (id: string) => void;
   toggleDb: (db: string) => void;
@@ -1506,6 +1608,7 @@ function NavRowImpl({
   subtreeSpine,
   spineFor,
   T,
+  onOpenServer,
   setFocusedId,
   toggleConnection,
   toggleDb,
@@ -1540,6 +1643,7 @@ function NavRowImpl({
           toggleConnection(row.conn.id);
         }}
         onCancel={() => cancelConnection(row.conn.id)}
+        onOpenServer={onOpenServer && (() => onOpenServer(row.conn.id))}
         onContextMenu={(e) => onRowContextMenu(e, row)}
       />
     );
@@ -1707,6 +1811,29 @@ function ConnErrorRow({
   onRetry: () => void;
   onReenterPassword?: (trigger: HTMLElement) => void;
 }) {
+  // Both open the form on its Authentication tab: a rejected password and one
+  // this install cannot decrypt are fixed in the same field.
+  const label =
+    row.code === 'AUTH' ? 'Edit credentials…' : row.code === 'SECRET_UNREADABLE' ? 'Re-enter password' : null;
+  const credentials = label !== null && onReenterPassword && {
+    first: row.code === 'AUTH',
+    button: (
+      <Button
+        type="button"
+        variant={row.code === 'AUTH' ? 'filled' : 'default'}
+        size="compact-xs"
+        fz={T.fsXs}
+        c={row.code === 'AUTH' ? undefined : T.text}
+        aria-label={`${label.replace('…', '')} for ${row.conn.name}`}
+        onClick={(e) => {
+          e.stopPropagation();
+          onReenterPassword(e.currentTarget);
+        }}
+      >
+        {label}
+      </Button>
+    ),
+  };
   return (
     <div
       id={navigatorRowDomId(row.id)}
@@ -1728,40 +1855,28 @@ function ConnErrorRow({
       <div style={{ color: T.textMuted, marginBottom: 6, overflowWrap: 'anywhere' }}>
         {row.message}
       </div>
-      {/* A denied macOS keychain stays denied until relaunch, so Retry cannot succeed. */}
-      {row.code !== 'KEYCHAIN_BLOCKED' && (
-        <Button
-          type="button"
-          variant="default"
-          size="compact-xs"
-          fz={T.fsXs}
-          c={T.text}
-          aria-label={row.retryLabel}
-          onClick={(e) => {
-            e.stopPropagation();
-            onRetry();
-          }}
-        >
-          Retry
-        </Button>
-      )}
-      {row.code === 'SECRET_UNREADABLE' && onReenterPassword && (
-        <Button
-          type="button"
-          variant="default"
-          size="compact-xs"
-          fz={T.fsXs}
-          c={T.text}
-          ml={6}
-          aria-label={`Re-enter password for ${row.conn.name}`}
-          onClick={(e) => {
-            e.stopPropagation();
-            onReenterPassword(e.currentTarget);
-          }}
-        >
-          Re-enter password
-        </Button>
-      )}
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: T.gapSm }}>
+        {/* Retrying the same wrong password fails the same way, so the fix comes first. */}
+        {credentials && credentials.first && credentials.button}
+        {/* A denied macOS keychain stays denied until relaunch, so Retry cannot succeed. */}
+        {row.code !== 'KEYCHAIN_BLOCKED' && (
+          <Button
+            type="button"
+            variant="default"
+            size="compact-xs"
+            fz={T.fsXs}
+            c={T.text}
+            aria-label={row.retryLabel}
+            onClick={(e) => {
+              e.stopPropagation();
+              onRetry();
+            }}
+          >
+            Retry
+          </Button>
+        )}
+        {credentials && !credentials.first && credentials.button}
+      </div>
     </div>
   );
 }
@@ -1777,6 +1892,7 @@ function ConnectionRow({
   errorRowId,
   onClick,
   onCancel,
+  onOpenServer,
   onContextMenu,
 }: {
   T: Theme;
@@ -1790,8 +1906,11 @@ function ConnectionRow({
   errorRowId: string | null;
   onClick: () => void;
   onCancel: () => void;
+  onOpenServer?: () => void;
   onContextMenu: (e: React.MouseEvent) => void;
 }) {
+  const [hovered, setHovered] = React.useState(false);
+  const barVisible = hovered || isFocused;
   // Status is spoken in words, never colour alone (a11y).
   const statusWord = isConnected
     ? 'Connected'
@@ -1806,7 +1925,9 @@ function ConnectionRow({
       role="treeitem"
       aria-level={1}
       aria-expanded={isExpanded}
-      aria-label={`${conn.name}. ${statusWord}${conn.readOnly ? '. Read-only' : ''}`}
+      aria-label={`${conn.name}. ${statusWord}${conn.readOnly ? '. Read-only' : ''}${
+        dbCount === null ? '' : `. ${countText(dbCount, 'database')}`
+      }`}
       // #66 — names this root's own error message, when it has one, so a
       // keyboard/AT user landed on the root (not just on the Retry button)
       // hears why it failed, not just that it did.
@@ -1822,6 +1943,8 @@ function ConnectionRow({
       // names this row instead.
       onClick={onClick}
       onContextMenu={onContextMenu}
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
       title={`Status: ${conn.status}`}
       style={{
         display: 'flex',
@@ -1830,10 +1953,11 @@ function ConnectionRow({
         fontSize: T.fsSm,
         cursor: 'pointer',
         userSelect: 'none',
-        padding: '5px 10px',
+        minHeight: ROW_HEIGHT,
+        boxSizing: 'border-box',
+        padding: '4px 10px',
         color: isConnected ? T.text : T.textMuted,
         fontWeight: 600,
-        background: isFocused ? T.accentSoft : 'transparent',
         outline: isFocused ? `1px solid ${T.accentBorder}` : 'none',
         outlineOffset: -1,
       }}
@@ -1907,10 +2031,51 @@ function ConnectionRow({
           Cancel
         </Button>
       )}
-      {dbCount !== null && (
-        <span style={{ fontSize: T.fsXs, color: T.textGhost }}>{dbCount}</span>
+      {/* On hover and on keyboard focus, as the database row's bar is. */}
+      {barVisible && (
+        <>
+          {onOpenServer && (
+            <Button
+              type="button"
+              variant="default"
+              size="compact-xs"
+              h={18}
+              px={6}
+              fz={T.fsXs}
+              c={T.text}
+              aria-label={`Server overview for ${conn.name}`}
+              onClick={(e) => {
+                e.stopPropagation();
+                onOpenServer();
+              }}
+              style={{ flexShrink: 0 }}
+            >
+              Server
+            </Button>
+          )}
+          <HoverBarButton
+            T={T}
+            label={`Actions for ${conn.name}`}
+            icon={<IconDots size={14} />}
+            onClick={(e) => {
+              e.stopPropagation();
+              onContextMenu(e);
+            }}
+          />
+        </>
       )}
+      {dbCount !== null && !barVisible && <CountBadge T={T} n={dbCount} noun="database" />}
     </div>
+  );
+}
+
+/** The digit, with what it counts as its tooltip and its accessible text. */
+function CountBadge({ T, n, noun }: { T: Theme; n: number; noun: string }) {
+  return (
+    <span title={countText(n, noun)} style={{ fontSize: T.fsXs, color: T.textGhost }}>
+      <span aria-hidden>{n}</span>
+      <VisuallyHidden>{countText(n, noun)}</VisuallyHidden>
+    </span>
   );
 }
 
@@ -1957,14 +2122,12 @@ function DbRow({
         fontSize: T.fsSm,
         cursor: 'pointer',
         userSelect: 'none',
+        minHeight: ROW_HEIGHT,
+        boxSizing: 'border-box',
         padding: '4px 6px 4px 18px',
         color: !dimmed && isActiveDb ? T.text : T.textMuted,
+        // Weight, not a fill: only the Focused Tab's collection is filled.
         fontWeight: isActiveDb ? 600 : 500,
-        background: isActiveDb
-          ? T.surfaceRaised
-          : isFocused
-            ? T.accentSoft
-            : 'transparent',
         outline: isFocused ? `1px solid ${T.accentBorder}` : 'none',
         outlineOffset: -1,
       }}
@@ -2023,7 +2186,7 @@ function DbRow({
         />
       </div>
       {row.count !== null && !barVisible && !row.refreshing && (
-        <span style={{ fontSize: T.fsXs, color: T.textGhost }}>{row.count}</span>
+        <CountBadge T={T} n={row.count} noun="collection" />
       )}
       {row.refreshing && (
         <span
@@ -2091,7 +2254,7 @@ function CollRow({
   onClick: (e: React.MouseEvent) => void;
   onContextMenu: (e: React.MouseEvent) => void;
 }) {
-  const { coll, isActive } = row;
+  const { coll, isActive, hasOpenTab } = row;
   const icon =
     coll.type === 'view'
       ? I.view
@@ -2125,15 +2288,14 @@ function CollRow({
         fontSize: T.fsSm,
         cursor: 'pointer',
         userSelect: 'none',
+        minHeight: ROW_HEIGHT,
+        boxSizing: 'border-box',
         padding: '3px 10px 3px 46px',
         color: !dimmed && isActive ? T.accentInk : T.textMuted,
-        background: isActive
-          ? T.accentSoft
-          : isFocused
-            ? T.accentSoft
-            : 'transparent',
+        // The one fill in the tree: the Focused Tab's collection.
+        background: isActive ? T.accentSoft : 'transparent',
         fontWeight: isActive ? 600 : 400,
-        outline: isFocused && !isActive ? `1px solid ${T.accentBorder}` : 'none',
+        outline: isFocused ? `1px solid ${T.accentBorder}` : 'none',
         outlineOffset: -1,
       }}
     >
@@ -2172,8 +2334,10 @@ function CollRow({
           {coll.type === 'view' ? 'VIEW' : coll.type === 'timeseries' ? 'TS' : 'CAPPED'}
         </span>
       )}
-      {isActive && (
+      {hasOpenTab && !isActive && (
         <span
+          data-testid="nav-open-tab-dot"
+          title="Open in a tab"
           style={{
             width: 5,
             height: 5,
@@ -2181,7 +2345,9 @@ function CollRow({
             background: T.accent,
             flexShrink: 0,
           }}
-        />
+        >
+          <VisuallyHidden>Open in a tab</VisuallyHidden>
+        </span>
       )}
     </div>
   );

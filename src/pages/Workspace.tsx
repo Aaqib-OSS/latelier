@@ -5,17 +5,22 @@ import { themeVars } from '../theme/themeVars';
 import { AppShell } from '@mantine/core';
 import { type PanelImperativeHandle } from 'react-resizable-panels';
 import { useWorkspaceTabs } from '../state/workspaceTabs';
+import { reopenClosedTab } from './Workspace/reopenClosedTab';
 import { useConnections, isConnectionActive, isKnownNotConnected } from '../state/connections';
 import { setFocusedConnectionId as publishFocusedConnectionId } from '../state/focusedConnection';
+import { publishPaletteCollections } from '../state/paletteCollections';
+import { isSweepPending, sweepConnectionId } from './Workspace/collectionSweep';
 import { api, getErrorMessage, isIpcError } from '../api/atelier';
 import { logFailure } from '../utils/rendererLog';
 import { notify } from '../theme/notifications';
 import { ejsonParse, isPlainDocument } from '../utils/ejson';
 import { buildUpdateRequest, setAtSegments } from './Workspace/documentDiff';
 import { copyToClipboard } from '../utils/clipboard';
-import { BUILDER_MIN_PCT } from './Workspace/panelSizes';
+import { CODE_LANGS } from '../utils/driverCode';
+import { copyQueryAsCode } from './Workspace/copyQueryCode';
+import { BUILDER_DEFAULT_PX, BUILDER_MIN_PCT } from './Workspace/panelSizes';
 import { ONE_PANEL_BUILDER_PX } from './Workspace/sidePanels';
-import type { CollectionView, SavedQuerySummary, WorkspaceTab } from '@shared/types';
+import type { CollectionView, SavedQuerySummary, ServerSection, WorkspaceTab } from '@shared/types';
 import { DEFAULT_AGGREGATION_TAB_STATE, DEFAULT_SCHEMA_TAB_STATE } from '@shared/defaults';
 import { useReferenceRules } from '../features/references/useReferenceRules';
 import { useReferenceDrawer } from './Workspace/useReferenceDrawer';
@@ -29,6 +34,7 @@ import { useQueryRunner } from './Workspace/useQueryRunner';
 import { recordFilterStep } from './Workspace/filterStep';
 import { parsePastedObjectId } from '../commands/pastedId';
 import type { RunnerTarget } from './Workspace/useQueryRunner';
+import { registerCollectionRerun, type UndoTarget } from './Workspace/undoStore';
 import { useWorkspacePanelPrefs } from './Workspace/useWorkspacePanelPrefs';
 import { useNavigatorData, useNavigatorStatusSync } from './Workspace/useNavigatorData';
 import { ownGet } from '../utils/ownProperty';
@@ -41,6 +47,7 @@ import { useCollectionTabActions } from './Workspace/useCollectionTabActions';
 import { DialogStack } from './Workspace/DialogStack';
 import { ShellSection } from './Workspace/ShellSection';
 import { PanelBody, type PanelBodyCollectionProps } from './Workspace/PanelBody';
+import { StatusBar } from './Workspace/StatusBar';
 import type { IndexCreateRequest } from './IndexesTab';
 import { useSettings } from './SettingsContext';
 import { useRegisterCommands } from '../commands/useRegisterCommands';
@@ -87,7 +94,7 @@ function WorkspaceInner() {
     refresh: refreshConnections,
     removeLocal: removeConnectionLocal,
   } = useConnections();
-  const { dark, toggle } = useWorkspaceThemeBridge();
+  const { dark } = useWorkspaceThemeBridge();
   const [newTabOpen, setNewTabOpen] = React.useState(false);
 
   const panelPrefs = useWorkspacePanelPrefs();
@@ -128,7 +135,9 @@ function WorkspaceInner() {
   // `resize()` treats a number as pixels and a string as a percentage —
   // `resize(26)` is 26px, not 26%. `expand()` alone reopens at the collapsed
   // 4% rail, so the width is set explicitly from the stored split after.
+  const panelPrefsRef = useLatest(panelPrefs);
   const innerHSplitRef = useLatest(innerHSplit);
+  const innerHSplitStoredRef = useLatest(panelPrefs.innerHSplitStored);
   const restoreBuilderWidth = React.useCallback(() => {
     const handle = builderPanelRef.current;
     if (!handle) return;
@@ -137,10 +146,14 @@ function WorkspaceInner() {
       handle.resize(ONE_PANEL_BUILDER_PX);
       return;
     }
+    if (!innerHSplitStoredRef.current) {
+      handle.resize(BUILDER_DEFAULT_PX);
+      return;
+    }
     // Floor at BUILDER_MIN_PCT in case a stored split is narrower than draggable.
     const pct = Math.max(innerHSplitRef.current, BUILDER_MIN_PCT);
     handle.resize(`${pct}%`);
-  }, [innerHSplitRef, onePanelOnly]);
+  }, [innerHSplitRef, innerHSplitStoredRef, onePanelOnly]);
 
   const toggleBuilder = React.useCallback(() => {
     const next = !builderCollapsed;
@@ -179,20 +192,19 @@ function WorkspaceInner() {
     restoreBuilderWidth();
   }, [builderCollapsedRef, commitBuilderCollapsed, restoreBuilderWidth]);
 
-  // Moves focus to the drawer's selected tab on expand, or back to the notch
-  // on collapse — a flag+effect because BuilderPane isn't mounted while
-  // collapsed, so there's nothing to focus until the next render.
-  const notchRef = React.useRef<HTMLButtonElement>(null);
+  // Moves focus to the Inspector's selected tab on open, or back to the
+  // Builder button on close — a flag+effect because BuilderPane isn't mounted
+  // while collapsed, so there's nothing to focus until the next render.
   const moveFocusOnBuilderToggle = React.useRef(false);
   React.useEffect(() => {
     if (!moveFocusOnBuilderToggle.current) return;
     moveFocusOnBuilderToggle.current = false;
     if (builderCollapsed) {
-      notchRef.current?.focus();
+      document.querySelector<HTMLElement>('[data-builder-toggle]')?.focus();
       return;
     }
     const selectedTab = document.querySelector<HTMLElement>(
-      '[aria-label="Query drawer"] [role="tab"][aria-selected="true"]',
+      '[aria-label="Inspector view"] [role="tab"][aria-selected="true"]',
     );
     selectedTab?.focus();
   }, [builderCollapsed]);
@@ -422,7 +434,15 @@ function WorkspaceInner() {
   const skipAutoRunRef = React.useRef<string | null>(null);
   // Bumped by each saved query the palette loads, added to PanelBody's own load counter.
   const [savedLoadGen, setSavedLoadGen] = React.useState(0);
+  // W01 §14.10 — the tab in front when the launch restore lands runs once,
+  // whatever its filter, and the focus then rests in its filter editor rather
+  // than on <body>. `undefined` until the restore has landed, then that tab's
+  // id until it has run; every other tab stays lazy.
+  const restoredTabRef = React.useRef<string | null | undefined>(undefined);
+  const focusFilterRef = React.useRef(false);
   React.useEffect(() => {
+    if (tabs.loading) return;
+    if (restoredTabRef.current === undefined) restoredTabRef.current = activeCollection?.id ?? null;
     if (!activeCollection) return;
     if (activeView !== 'documents') return;
     if (skipAutoRunRef.current === activeCollection.id) {
@@ -430,12 +450,29 @@ function WorkspaceInner() {
       return;
     }
     if (activeCollection.state.lastRun) return;
-    if (!isDefaultQueryState(activeCollection.state)) return;
+    // A restored query is the user's own, so it runs only against a
+    // Connection known to be connected and only when it can run as written.
+    const restored =
+      restoredTabRef.current === activeCollection.id &&
+      focusedConnection?.status === 'connected' &&
+      findProblem(activeCollection.state) === null;
+    if (!restored && !isDefaultQueryState(activeCollection.state)) return;
     if (pendingSavedRef.current?.tabId === activeCollection.id) return;
     if (isKnownNotConnected(focusedConnection)) return;
+    if (restoredTabRef.current === activeCollection.id) {
+      restoredTabRef.current = null;
+      focusFilterRef.current = true;
+    }
     void queryRunner.run();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeCollection?.id, activeView, queryRunner.run, focusedConnection]);
+  }, [tabs.loading, activeCollection?.id, activeView, queryRunner.run, focusedConnection]);
+  // After the run above, once the Filter Bar is on screen. Only from <body>:
+  // a dialog or a field the user already reached keeps the focus.
+  React.useEffect(() => {
+    if (!focusFilterRef.current || initialLoadPending) return;
+    focusFilterRef.current = false;
+    if (document.activeElement === document.body) document.getElementById('query-bar-filter')?.focus();
+  }, [initialLoadPending, tabs.loading, activeCollection?.id, activeView, focusedConnection]);
 
   // Refs let palette-command perform() closures see fresh values without
   // re-registering on every state tick.
@@ -444,6 +481,13 @@ function WorkspaceInner() {
   const activeScriptRef = useLatest(activeScript);
   const tabsRef = useLatest(tabs);
   const focusedConnectionRef = useLatest(focusedConnection);
+  // W01 §14.8: reopens the newest closed tab whose Connection still exists.
+  const knownConnectionsRef = useLatest(connections);
+  const connectionsLoadingRef = useLatest(connectionsLoading);
+  const reopenClosed = React.useCallback(
+    () => reopenClosedTab(tabsRef.current, knownConnectionsRef.current, connectionsLoadingRef.current),
+    [tabsRef, knownConnectionsRef, connectionsLoadingRef],
+  );
 
   // "Go to Indexes" / "Go to Schema" from the palette: the Structure view may
   // not be mounted yet when the command runs, so the scroll waits for the
@@ -539,6 +583,7 @@ function WorkspaceInner() {
     },
     [activeCollectionRef, selectActiveView],
   );
+  const openDocuments = React.useCallback(() => selectActiveView('documents'), [selectActiveView]);
   const onCreateIndexConsumed = React.useCallback(() => setCreateIndexRequest(null), []);
   // The post-write refresh target, resolved fresh from `tabsRef` at
   // completion time rather than snapshotted, since a drawer pinned to tab A
@@ -556,6 +601,25 @@ function WorkspaceInner() {
       };
     },
     [tabsRef],
+  );
+  const resolveNamespaceTargets = React.useCallback(
+    (ns: UndoTarget): RunnerTarget[] =>
+      tabsRef.current.tabs.flatMap((t) =>
+        t.kind === 'collection' &&
+        t.connectionId === ns.connectionId &&
+        t.dbName === ns.dbName &&
+        t.collection === ns.collection
+          ? (resolveRunnerTarget(t.id) ?? [])
+          : [],
+      ),
+    [resolveRunnerTarget, tabsRef],
+  );
+  React.useEffect(
+    () =>
+      registerCollectionRerun((ns) => {
+        for (const t of resolveNamespaceTargets(ns)) void run(undefined, t);
+      }),
+    [resolveNamespaceTargets, run],
   );
   const activeIsView =
     activeCollection !== null &&
@@ -578,6 +642,7 @@ function WorkspaceInner() {
     queryRunner,
     activeTabId: tabs.activeId,
     resolveRunnerTarget,
+    resolveNamespaceTargets,
     readOnly: focusedConnection?.readOnly ?? false,
     isView: activeIsView,
   });
@@ -660,10 +725,17 @@ function WorkspaceInner() {
           // would re-enable it against the stale value, and a second click
           // there would guard its compare-and-set on that stale value too.
           const refreshed = rerunEdited();
-          offerUndo('Field updated', auditId, () => {
-            invalidateSampleSchemaCache(a.connectionId, a.dbName, a.collection);
-            void rerunEdited();
-          });
+          // The undo is the collection's, and ⌘Z runs it from any tab on it:
+          // all of them re-run, whether or not the edited tab is still open.
+          offerUndo(
+            'Field updated',
+            auditId,
+            () => {
+              invalidateSampleSchemaCache(a.connectionId, a.dbName, a.collection);
+              for (const t of resolveNamespaceTargets(a)) void run(undefined, t);
+            },
+            a,
+          );
           return refreshed.then(() => OK);
         })
         .catch((e: unknown): UpdateFieldOutcome => {
@@ -672,7 +744,7 @@ function WorkspaceInner() {
           return { ok: false, message };
         });
     },
-    [activeCollectionRef, resolveRunnerTarget, run],
+    [activeCollectionRef, resolveNamespaceTargets, resolveRunnerTarget, run],
   );
   const workspaceActions = React.useMemo<CollectionWorkspaceActions>(
     () => ({
@@ -690,6 +762,7 @@ function WorkspaceInner() {
       updateField,
       openDuplicate,
       openCreateIndex,
+      openDocuments,
     }),
     [
       patchActiveCollection,
@@ -706,6 +779,7 @@ function WorkspaceInner() {
       updateField,
       openDuplicate,
       openCreateIndex,
+      openDocuments,
     ],
   );
   const workspaceMeta = React.useMemo<CollectionWorkspaceMeta | null>(
@@ -788,6 +862,15 @@ function WorkspaceInner() {
         },
       },
       {
+        id: 'tab.reopen',
+        title: 'Reopen closed tab',
+        group: 'workspace',
+        shortcut: '⌘⇧T',
+        keywords: ['undo', 'closed', 'restore'],
+        when: () => tabsRef.current.closedCount > 0,
+        perform: () => void reopenClosed(),
+      },
+      {
         id: 'tab.pin.toggle',
         title: 'Pin tab',
         group: 'workspace',
@@ -802,9 +885,10 @@ function WorkspaceInner() {
       },
       {
         id: 'shell.toggle',
-        title: 'Shell',
+        title: 'Console',
         group: 'workspace',
-        keywords: ['mongosh', 'repl', 'terminal', 'open', 'close', 'toggle'],
+        shortcut: '⌃`',
+        keywords: ['mongosh', 'repl', 'terminal', 'shell', 'open', 'close', 'toggle'],
         toggle: { checked: shellOpen },
         when: () => focusedConnectionRef.current !== null,
         perform: () => setShellOpen((v) => !v),
@@ -833,19 +917,59 @@ function WorkspaceInner() {
       },
       {
         id: 'query.drawer.toggle',
-        title: 'Query drawer',
+        title: 'Query builder',
         group: 'query',
-        shortcut: '⌘B',
-        keywords: ['builder', 'filter', 'panel', 'sidebar', 'saved', 'recent', 'expand', 'collapse', 'toggle'],
+        shortcut: '⌘⇧B',
+        keywords: ['builder', 'filter', 'panel', 'inspector', 'drawer', 'expand', 'collapse', 'toggle'],
         toggle: { checked: !builderCollapsed },
         // Builder is shut and hidden outside documents view and absent for script tabs.
         when: () =>
           activeCollectionRef.current !== null &&
           (activeCollectionRef.current.state.activeView ?? 'documents') === 'documents',
-        // The palette stays open on a toggle, so focus stays in it: ⌘B moves
-        // focus with the drawer, this does not.
+        // The palette stays open on a toggle, so focus stays in it: ⌘⇧B moves
+        // focus with the Inspector, this does not.
         perform: toggleBuilder,
       },
+      {
+        id: 'view.sidebar.toggle',
+        title: 'Toggle sidebar',
+        group: 'view',
+        shortcut: '⌘B',
+        keywords: ['navigator', 'collections', 'panel', 'expand', 'collapse'],
+        toggle: { checked: !sidebarCollapsed },
+        perform: () => panelPrefsRef.current.toggleSidebar(),
+      },
+      {
+        id: 'query.focus',
+        title: 'Focus filter',
+        group: 'query',
+        shortcut: '⌘L',
+        keywords: ['query', 'search', 'input'],
+        when: () =>
+          activeCollectionRef.current !== null &&
+          (activeCollectionRef.current.state.activeView ?? 'documents') === 'documents',
+        perform: () => document.getElementById('query-bar-filter')?.focus(),
+      },
+      ...(
+        [
+          ['documents', 'Go to documents', '⌥1'],
+          ['aggregation', 'Go to aggregation', '⌥2'],
+          ['structure', 'Go to schema & indexes', '⌥3'],
+        ] as const
+      ).map(([view, title, shortcut]) => ({
+        id: `view.${view}`,
+        title,
+        group: 'view' as const,
+        shortcut,
+        keywords: view === 'structure' ? ['structure', 'fields', 'index'] : [view],
+        // eslint-disable-next-line react-hooks/refs
+        when: () => activeCollectionRef.current !== null,
+        perform: () => {
+          const a = activeCollectionRef.current;
+          // eslint-disable-next-line react-hooks/refs
+          if (a) tabsRef.current.setActiveView(a.id, view);
+        },
+      })),
       {
         id: 'query.run',
         title: 'Run query',
@@ -880,6 +1004,20 @@ function WorkspaceInner() {
           if (raw) void copyToClipboard(raw, 'Query copied to the clipboard.');
         },
       },
+      // The Run menu's Copy query as…, one command per target (W05 §9.5).
+      ...CODE_LANGS.map(({ lang, label }) => ({
+        id: `query.copy-as.${lang}`,
+        title: `Copy query as ${label}`,
+        group: 'query' as const,
+        keywords: ['copy', 'code', 'snippet', 'driver', 'find'],
+        when: () =>
+          activeCollectionRef.current !== null &&
+          (activeCollectionRef.current.state.activeView ?? 'documents') === 'documents',
+        perform: () => {
+          const a = activeCollectionRef.current;
+          if (a) copyQueryAsCode(lang, a.state, a.collection);
+        },
+      })),
       {
         id: 'doc.insert',
         title: 'Insert document…',
@@ -915,17 +1053,23 @@ function WorkspaceInner() {
         },
       })),
     ],
-    [active?.pinned, builderCollapsed, shellOpen, toggleBuilder, activeIsView, showStructure],
+    [active?.pinned, builderCollapsed, sidebarCollapsed, shellOpen, toggleBuilder, activeIsView, showStructure],
   );
 
   // `⌘K → orders`-style commands for every collection of the focused
   // Connection. The sweep fills the navigator's own cache, so the navigator
   // never fetches what the palette already has, and the reverse.
   const { tree: navigatorTree, loadDbs, loadColls } = navigatorData;
-  const focusedCache = focusedConnectionId
-    ? ownGet(navigatorTree.caches, focusedConnectionId)
-    : undefined;
-  const focusedIsConnected = focusedConnection?.status === 'connected';
+  // The Focused Tab's Connection, or with no tab the most recently connected
+  // Open Connection, so a palette connect lists its collections at once.
+  const sweepId = sweepConnectionId(focusedConnectionId, connections);
+  const sweepCache = sweepId ? ownGet(navigatorTree.caches, sweepId) : undefined;
+  const sweepIsConnected = connections.find((c) => c.id === sweepId)?.status === 'connected';
+  const sweepPending = sweepIsConnected && isSweepPending(sweepCache);
+  React.useEffect(() => {
+    publishPaletteCollections({ connectionId: sweepIsConnected ? sweepId : null, pending: sweepPending });
+  }, [sweepId, sweepIsConnected, sweepPending]);
+  React.useEffect(() => () => publishPaletteCollections({ connectionId: null, pending: false }), []);
   // One attempt per database per database list: a database whose listing
   // failed is not retried on every render, and a refreshed list sweeps again.
   const sweptRef = React.useRef<{ dbs: DbInfo[] | null; done: Set<string> }>({
@@ -936,10 +1080,10 @@ function WorkspaceInner() {
   const relistRef = React.useRef<{ id: string | null; names: Set<string> }>({ id: null, names: new Set() });
   const [relists, setRelists] = React.useState(0);
   React.useEffect(() => {
-    if (!focusedConnectionId || !focusedIsConnected) return;
-    if (reconnectedRef.current.delete(focusedConnectionId)) {
+    if (!sweepId || !sweepIsConnected) return;
+    if (reconnectedRef.current.delete(sweepId)) {
       // The expanded databases were already re-listed by the status sync.
-      const id = focusedConnectionId;
+      const id = sweepId;
       const expanded = ownGet(navigatorTree.expanded, id) ?? {};
       void loadDbs(id, { force: true }).then((dbs) => {
         const names = (dbs ?? []).filter((d) => !ownGet(expanded, d.name)).map((d) => d.name);
@@ -949,14 +1093,14 @@ function WorkspaceInner() {
       });
       return;
     }
-    const c = focusedCache;
+    const c = sweepCache;
     if (!c?.dbs) {
-      if (!c?.dbsLoading && !c?.err) void loadDbs(focusedConnectionId);
+      if (!c?.dbsLoading && !c?.err) void loadDbs(sweepId);
       return;
     }
     if (sweptRef.current.dbs !== c.dbs) sweptRef.current = { dbs: c.dbs, done: new Set() };
     const { done } = sweptRef.current;
-    const relist = relistRef.current.id === focusedConnectionId ? relistRef.current.names : null;
+    const relist = relistRef.current.id === sweepId ? relistRef.current.names : null;
     // A few listings at a time, the navigator's own included, so a server with
     // hundreds of databases is not asked for all of them at once. Each one that
     // settles changes the cache and so runs this again for the next.
@@ -968,12 +1112,12 @@ function WorkspaceInner() {
       done.add(d.name);
       relist?.delete(d.name);
       inFlight++;
-      void loadColls(focusedConnectionId, d.name);
+      void loadColls(sweepId, d.name);
     }
   }, [
-    focusedConnectionId,
-    focusedIsConnected,
-    focusedCache,
+    sweepId,
+    sweepIsConnected,
+    sweepCache,
     loadDbs,
     loadColls,
     reconnects,
@@ -985,7 +1129,6 @@ function WorkspaceInner() {
   // the sidebar opens first: the dialog is the navigator's own.
   const [navigatorDialogRequest, setNavigatorDialogRequest] = React.useState<NavigatorDialogRequest | null>(null);
   const clearNavigatorDialog = React.useCallback(() => setNavigatorDialogRequest(null), []);
-  const panelPrefsRef = useLatest(panelPrefs);
   const requestNavigatorDialog = React.useCallback(
     (request: NavigatorDialogRequest) => {
       if (panelPrefsRef.current.sidebarCollapsed) panelPrefsRef.current.toggleSidebar();
@@ -1003,6 +1146,17 @@ function WorkspaceInner() {
       navigatorDispatch({ type: 'expandedConnSet', id: connectionId });
       navigatorDispatch({ type: 'dbExpandedSet', connectionId, dbName, value: true });
       setNavigatorRevealRequest({ connectionId, dbName });
+    },
+    [panelPrefsRef, navigatorDispatch, setNavigatorRevealRequest],
+  );
+
+  // A palette connect lands on the Connection's root in the navigator, so the
+  // next keys move through its databases instead of into the void.
+  const revealConnectionRoot = React.useCallback(
+    (connectionId: string) => {
+      if (panelPrefsRef.current.sidebarCollapsed) panelPrefsRef.current.toggleSidebar();
+      navigatorDispatch({ type: 'expandedConnSet', id: connectionId });
+      setNavigatorRevealRequest({ connectionId });
     },
     [panelPrefsRef, navigatorDispatch, setNavigatorRevealRequest],
   );
@@ -1182,24 +1336,58 @@ function WorkspaceInner() {
   React.useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       const mod = e.metaKey || e.ctrlKey;
+      const origin = e.target instanceof HTMLElement ? e.target : null;
+      // ⌥1–⌥3 (W01 §14.11): the code, since Option-digit types a character on
+      // a Mac. Left alone in a text field, where that character is the point.
+      if (e.altKey && !mod && !e.shiftKey && /^Digit[123]$/.test(e.code)) {
+        const a = activeCollectionRef.current;
+        if (!a || origin?.closest('[role="dialog"], [role="alertdialog"], input, textarea, select, [contenteditable="true"]')) return;
+        e.preventDefault();
+        tabs.setActiveView(a.id, (['documents', 'aggregation', 'structure'] as const)[Number(e.code.slice(5)) - 1]!);
+        return;
+      }
       if (!mod) return;
       // Grouped-by-connection order, matching what's on screen (not stored order).
       const ids = groupTabsByConnection(tabs.tabs).flatMap((g) =>
         g.tabs.map((t) => t.id),
       );
-      if (e.key === 't') {
+      if (e.key === '`' && e.ctrlKey && !e.metaKey && !e.shiftKey && !e.altKey) {
+        // The Console (W11 §8.2): from anywhere in the workspace outside a dialog.
+        if (origin?.closest('[role="dialog"], [role="alertdialog"]') || !focusedConnectionRef.current) return;
         e.preventDefault();
-        setNewTabOpen(true);
-      } else if (e.key === 'b') {
+        setShellOpen((v) => !v);
+      } else if (e.key.toLowerCase() === 't') {
+        e.preventDefault();
+        // ⇧ held: the key reads 'T'. ⌘⇧T reopens, ⌘T opens (W01 §14.8).
+        // A dialog's own focus keeps ⌘⇧T: reopening behind it would be missed.
+        if (e.shiftKey) {
+          if (!origin?.closest('[role="dialog"], [role="alertdialog"]')) void reopenClosed();
+        }
+        else setNewTabOpen(true);
+      } else if (e.key.toLowerCase() === 'b') {
         // A dialog has no ⌘B handler, so the event bubbles here — must not
-        // toggle the drawer behind an open modal. `instanceof`, not a cast:
+        // toggle a panel behind an open modal. `instanceof`, not a cast:
         // a window/document-dispatched keydown's target may lack `closest`.
-        const origin = e.target instanceof HTMLElement ? e.target : null;
         if (origin?.closest('[role="dialog"], [role="alertdialog"]')) return;
+        if (e.shiftKey) {
+          // ⌘⇧B: the Query Builder, on Documents only (W01 §14.11).
+          const a = activeCollectionRef.current;
+          if (!a || (a.state.activeView ?? 'documents') !== 'documents') return;
+          e.preventDefault();
+          toggleBuilderWithFocus();
+        } else if (!e.altKey) {
+          e.preventDefault();
+          panelPrefsRef.current.toggleSidebar();
+        }
+      } else if (e.key.toLowerCase() === 'l' && !e.shiftKey && !e.altKey) {
+        // ⌘L: the filter, from anywhere in the Documents view outside a dialog.
         const a = activeCollectionRef.current;
+        if (origin?.closest('[role="dialog"], [role="alertdialog"]')) return;
         if (!a || (a.state.activeView ?? 'documents') !== 'documents') return;
+        // Ctrl+L already handled below (the Console clears its output) is not ours to take.
+        if (e.defaultPrevented) return;
         e.preventDefault();
-        toggleBuilderWithFocus();
+        document.getElementById('query-bar-filter')?.focus();
       } else if (e.key === 'w') {
         e.preventDefault();
         if (tabs.activeId) void closeTabGuarded(tabs, tabs.activeId);
@@ -1224,7 +1412,7 @@ function WorkspaceInner() {
     };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [tabs, activeCollectionRef, toggleBuilderWithFocus]);
+  }, [tabs, activeCollectionRef, toggleBuilderWithFocus, reopenClosed, focusedConnectionRef, panelPrefsRef]);
 
   const handlePick = async (input: {
     connectionId: string;
@@ -1283,13 +1471,16 @@ function WorkspaceInner() {
     [tabsRef],
   );
 
-  const openConnectionScreen = React.useCallback(
-    (id: string) => {
-      // The dialogs hook ignores the result; navigate's promise only settles the transition.
-      void navigate(`/connections/${id}`);
+  // C05 §11: the server screen is a tab, one per Connection.
+  const openServerTab = React.useCallback(
+    (id: string, section?: ServerSection) => {
+      tabsRef.current.openServer({ connectionId: id, section }).catch((err: unknown) => {
+        notify.error(isIpcError(err) ? err.message : String(err), { title: 'Could not open the server overview' });
+      });
     },
-    [navigate],
+    [tabsRef],
   );
+  const openConnectionScreen = React.useCallback((id: string) => openServerTab(id), [openServerTab]);
 
   const connectionDialogs = useConnectionDialogs({
     connections,
@@ -1416,13 +1607,12 @@ function WorkspaceInner() {
     }
     pendingSavedRef.current = null;
     if (pending.kind === 'rename') {
-      // The Saved list's own inline rename, on the collection's Saved tab.
+      // The Saved list's own inline rename, in the Filter Bar row's popover,
+      // which opens on the request.
       if ((tab.state.activeView ?? 'documents') !== 'documents') {
         skipAutoRunRef.current = tab.id;
         tabs.setActiveView(tab.id, 'documents');
       }
-      if (tab.state.activeBuilderTab !== 'Saved') tabs.patchCollectionState(tab.id, { activeBuilderTab: 'Saved' });
-      expandBuilder();
       requestSavedRename(tab.id, pending.savedId);
       return;
     }
@@ -1488,6 +1678,7 @@ function WorkspaceInner() {
         deleteConnectionId?: string;
         editConnectionId?: string;
         disconnectConnectionId?: string;
+        openServer?: { connectionId: string; section?: ServerSection };
       }
     | null;
   const openConnectionId = navState?.openConnectionId ?? null;
@@ -1496,7 +1687,11 @@ function WorkspaceInner() {
     if (!openConnectionId) return;
     void navigate(location.pathname, { replace: true, state: null });
     openConnection(openConnectionId);
-    if (!openCollectionFromNav) return;
+    if (!openCollectionFromNav) {
+      // Deferred, like the navigator's other reveals: this effect may not set state itself.
+      queueMicrotask(() => revealConnectionRoot(openConnectionId));
+      return;
+    }
     void tabsRef.current
       .openCollection({
         connectionId: openConnectionId,
@@ -1533,6 +1728,20 @@ function WorkspaceInner() {
     openEditConnectionModal(editConnectionId);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editConnectionId, connectionsLoading]);
+  // The palette's server actions and `/connections/:id` hand over the same
+  // way. An id that matches no saved Connection lands here as C05 §11.3's
+  // not-found toast.
+  const openServerIntent = navState?.openServer ?? null;
+  React.useEffect(() => {
+    if (!openServerIntent || connectionsLoading || tabs.loading) return;
+    void navigate(location.pathname, { replace: true, state: null });
+    if (!connections.some((c) => c.id === openServerIntent.connectionId)) {
+      notify.error('This connection no longer exists.');
+      return;
+    }
+    openServerTab(openServerIntent.connectionId, openServerIntent.section);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [openServerIntent, connectionsLoading, tabs.loading]);
   // `requestDisconnect` counts the Connection's open tabs to word its dialog,
   // and refuses while the tabs are still loading: wait for them too.
   React.useEffect(() => {
@@ -1577,17 +1786,22 @@ function WorkspaceInner() {
     onAdd: openAddConnectionModal,
   };
 
+  const welcome = !connectionsLoading && connections.length === 0;
+
   // mode="static" (CSS grid), not the default "fixed" (position: fixed) —
   // the Electron viewport is exactly 100vh and inner panes rely on
   // flex + overflow: hidden, which fixed positioning doesn't tolerate.
   return (
     <AppShell
       mode="static"
-      header={{ height: 80 }}
+      // Nothing saved is the welcome canvas: a title bar, and no tab strip, navigator or status bar.
+      header={{ height: welcome ? 40 : 72 }}
+      // The status bar (W01 §14.6), drawn after PanelBody under the same condition.
+      footer={connections.length > 0 ? { height: 24 } : undefined}
       navbar={{
-        // Manual width, not Mantine's `collapsed` flag (display:none has no
-        // room for an expand affordance) — a 40px rail keeps it visible.
-        width: sidebarCollapsed ? 40 : leftWidth,
+        // Manual width, not Mantine's `collapsed` flag: the title bar's
+        // sidebar toggle is the expand affordance, so collapsed is no width.
+        width: welcome || sidebarCollapsed ? 0 : leftWidth,
         // Must be truthy or Mantine's static-mode navbar CSS vars never emit,
         // pushing the navbar below Main in grid auto-placement.
         breakpoint: 'xs',
@@ -1604,8 +1818,6 @@ function WorkspaceInner() {
       }}
     >
       <ShellSection
-        dark={dark}
-        toggle={toggle}
         focusedConnection={focusedConnection}
         switcherProps={switcherProps}
         settings={settings}
@@ -1614,9 +1826,11 @@ function WorkspaceInner() {
         setShellOpen={setShellOpen}
         tabs={tabs}
         connections={connections}
+        connectionsLoading={connectionsLoading}
         connectionsWithTabs={connectionsWithTabs}
         active={active}
         scratchConnectionId={scratchConnectionId}
+        onOpenCollectionPicker={() => setNewTabOpen(true)}
         hints={hints}
         openConnection={openConnection}
         panelPrefs={panelPrefs}
@@ -1648,21 +1862,30 @@ function WorkspaceInner() {
         initialLoadPending={initialLoadPending}
         anyConnectionOpen={anyConnectionOpen}
         switcherProps={switcherProps}
-        setNewTabOpen={setNewTabOpen}
+        navigatorData={navigatorData}
+        onSearchCollections={palette.openCollections}
         active={active}
         openConnection={openConnection}
+        onWelcomeSaved={(id) => void connectionDialogs.handleConnectionSaved(id, { connect: true })}
         activeScript={activeScript}
         collection={panelBodyCollection}
         dark={dark}
         builderPanelRef={builderPanelRef}
         toggleBuilder={toggleBuilder}
-        notchRef={notchRef}
         structureInitialCreate={
           createIndexRequest?.tabId === activeCollection?.id ? createIndexRequest : null
         }
         onStructureInitialCreateConsumed={onCreateIndexConsumed}
         connectErrors={navigatorTree.connectErrors}
       />
+
+      {/* After Main in the DOM; the grid draws it at the bottom either way. Not
+          on the welcome canvas: with nothing saved there is nothing to state. */}
+      {connections.length > 0 && (
+        <AppShell.Footer aria-label="Status bar">
+          <StatusBar connection={focusedConnection} />
+        </AppShell.Footer>
+      )}
 
       <FeatureHint
         id="startup.restore"
@@ -1687,8 +1910,6 @@ function WorkspaceInner() {
         queryBarSaveOpen={queryBarSaveOpen}
         setQueryBarSaveOpen={setQueryBarSaveOpen}
         setSavedRefreshKey={setSavedRefreshKey}
-        expandBuilder={expandBuilder}
-        patchActiveCollection={patchActiveCollection}
         refsConfigureHint={refsConfigureHint}
         tabsPinHint={tabsPinHint}
         savedCreateHint={savedCreateHint}

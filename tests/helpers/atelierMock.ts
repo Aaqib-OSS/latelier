@@ -110,7 +110,12 @@ export function installAtelierMock(overrides: Deep<IpcApi> = {}): IpcApi {
       profileTail: async () => ({ docs: [] }),
     },
     prefs: {
-      get: async () => null,
+      // The Builder is closed on a profile with no stored choice. Most specs
+      // that render the Workspace are about the builder, so the default
+      // profile here has chosen to keep it open; the closed default has its
+      // own spec (`workspace-panel-prefs`).
+      get: (async (key: string) =>
+        key === 'ui.workspace.builderCollapsed' ? false : null) as IpcApi['prefs']['get'],
       set: async (_k, v) => v,
       getTheme: async () => 'system' as const,
       setTheme: async () => undefined,
@@ -189,6 +194,7 @@ export function installAtelierMock(overrides: Deep<IpcApi> = {}): IpcApi {
       openAggregation: unused('tabs.openAggregation') as IpcApi['tabs']['openAggregation'],
       openDefault: unused('tabs.openDefault') as IpcApi['tabs']['openDefault'],
       openScript: unused('tabs.openScript') as IpcApi['tabs']['openScript'],
+      openServer: unused('tabs.openServer') as IpcApi['tabs']['openServer'],
       update: unused('tabs.update') as IpcApi['tabs']['update'],
       close: unused('tabs.close') as IpcApi['tabs']['close'],
       setActive: unused('tabs.setActive') as IpcApi['tabs']['setActive'],
@@ -528,6 +534,7 @@ function makePermissiveStub(): IpcApi {
       openAggregation: noopAsync as IpcApi['tabs']['openAggregation'],
       openDefault: noopAsync as IpcApi['tabs']['openDefault'],
       openScript: noopAsync as IpcApi['tabs']['openScript'],
+      openServer: noopAsync as IpcApi['tabs']['openServer'],
       update: noopAsync as IpcApi['tabs']['update'],
       close: async () => ({ newActiveId: null }),
       setActive: async (id) => ({ id }),

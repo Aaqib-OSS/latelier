@@ -5,7 +5,7 @@ import { registerTabsChannels } from '../../electron/ipc/handlers/tabs';
 import { IPC_CHANNELS } from '../../shared/ipc';
 import type { WorkspaceStateService } from '../../electron/services/WorkspaceStateService';
 import type { AggregationSeed, Envelope } from '../../shared/ipc';
-import type { CollectionTab } from '../../shared/types';
+import type { CollectionTab, ServerTab } from '../../shared/types';
 import { WorkspaceStateService as RealWorkspaceStateService } from '../../electron/services/WorkspaceStateService';
 import { WorkspaceTabRepo } from '../../electron/db/repositories/WorkspaceTabRepo';
 import { SavedQueryRepo } from '../../electron/db/repositories/SavedQueryRepo';
@@ -305,6 +305,34 @@ describe('tabs:update — the filter draft, via router and SQLite', () => {
     expect((await update({ lastValidQuery: undefined })).ok).toBe(true);
     expect('lastValidQuery' in storedState()).toBe(false);
   });
+
+  it('persists "Keep options expanded" per tab, and refuses a value that is not a boolean', async () => {
+    expect('optionsExpanded' in storedState()).toBe(false);
+    expect((await update({ optionsExpanded: true })).ok).toBe(true);
+    expect(storedState().optionsExpanded).toBe(true);
+
+    const env = await update({ optionsExpanded: 'yes' });
+    expect(env.ok).toBe(false);
+    if (!env.ok) expect(env.error.code).toBe('VALIDATION');
+    expect(storedState().optionsExpanded).toBe(true);
+
+    expect((await update({ optionsExpanded: false })).ok).toBe(true);
+    expect(storedState().optionsExpanded).toBe(false);
+  });
+
+  it('persists the JSON display per tab, and refuses a value that is neither shell nor canonical', async () => {
+    expect('jsonDisplay' in storedState()).toBe(false);
+    expect((await update({ jsonDisplay: 'canonical' })).ok).toBe(true);
+    expect(storedState().jsonDisplay).toBe('canonical');
+
+    const env = await update({ jsonDisplay: 'relaxed' });
+    expect(env.ok).toBe(false);
+    if (!env.ok) expect(env.error.code).toBe('VALIDATION');
+    expect(storedState().jsonDisplay).toBe('canonical');
+
+    expect((await update({ jsonDisplay: 'shell' })).ok).toBe(true);
+    expect(storedState().jsonDisplay).toBe('shell');
+  });
 });
 
 /**
@@ -375,5 +403,102 @@ describe('tabs:openAggregation — initialState, via router and SQLite', () => {
     const env = await open({ stages: [{ id: 'x', op: '$match', body: '{}', enabled: true }] });
     expect(env.ok).toBe(false);
     if (!env.ok) expect(env.error.code).toBe('VALIDATION');
+  });
+});
+
+// C05 §11: one server tab per Connection, reached through `tabs:openServer`.
+describe('tabs:openServer — real service and SQLite', () => {
+  const CONN = 'conn-server';
+  const OTHER = 'conn-other';
+  let tmp: TempDb;
+  let shim: ReturnType<typeof createIpcShim>;
+
+  beforeEach(() => {
+    tmp = createTempDb();
+    insertConnectionRow(tmp.db, CONN);
+    insertConnectionRow(tmp.db, OTHER);
+    shim = createIpcShim();
+    const router = createRouter(shim.ipcMain, testSenderCheck);
+    registerTabsChannels(
+      router,
+      new RealWorkspaceStateService(new WorkspaceTabRepo(tmp.db, createTempCipher()), new SavedQueryService(new SavedQueryRepo(tmp.db, createTempCipher()))),
+    );
+  });
+
+  afterEach(() => {
+    tmp.cleanup();
+  });
+
+  const openServer = (connectionId: string) => shim.invoke<ServerTab>(IPC_CHANNELS.tabsOpenServer, { connectionId });
+  const listed = async () => {
+    const env = await shim.invoke<{ id: string; kind: string }[]>(IPC_CHANNELS.tabsList, undefined);
+    if (!env.ok) throw new Error(env.error.message);
+    return env.data;
+  };
+
+  it('creates one tab with empty db/collection and the Overview section', async () => {
+    const env = await openServer(CONN);
+    expect(env.ok).toBe(true);
+    if (!env.ok) return;
+    expect(env.data).toMatchObject({
+      kind: 'server',
+      connectionId: CONN,
+      dbName: '',
+      collection: '',
+      isActive: true,
+      state: { section: 'overview' },
+    });
+  });
+
+  it('returns the same tab on a second call, and gives another Connection its own', async () => {
+    const a = await openServer(CONN);
+    const b = await openServer(CONN);
+    const c = await openServer(OTHER);
+    if (!a.ok || !b.ok || !c.ok) throw new Error('openServer failed');
+    expect(b.data.id).toBe(a.data.id);
+    expect(c.data.id).not.toBe(a.data.id);
+    expect((await listed()).filter((t) => t.kind === 'server')).toHaveLength(2);
+  });
+
+  it('round-trips the section through tabs:update, and refuses an unknown one', async () => {
+    const opened = await openServer(CONN);
+    if (!opened.ok) throw new Error('openServer failed');
+    const patch = (section: string) =>
+      shim.invoke<ServerTab>(IPC_CHANNELS.tabsUpdate, { id: opened.data.id, patch: { state: { section } } });
+    const ok = await patch('roles');
+    expect(ok.ok && ok.data.state.section).toBe('roles');
+    const reopened = await openServer(CONN);
+    expect(reopened.ok && reopened.data.state.section).toBe('roles');
+    const bad = await patch('nope');
+    expect(bad.ok).toBe(false);
+    if (!bad.ok) expect(bad.error.code).toBe('VALIDATION');
+  });
+
+  it('refuses a section on a collection tab', async () => {
+    const col = await shim.invoke<{ id: string }>(IPC_CHANNELS.tabsOpenCollection, {
+      connectionId: CONN,
+      dbName: 'db',
+      collection: 'c',
+    });
+    if (!col.ok) throw new Error('openCollection failed');
+    const env = await shim.invoke(IPC_CHANNELS.tabsUpdate, { id: col.data.id, patch: { state: { section: 'roles' } } });
+    expect(env.ok).toBe(false);
+    if (!env.ok) expect(env.error.code).toBe('VALIDATION');
+  });
+
+  it('keeps the section when the tabs are reloaded from the database', async () => {
+    const opened = await openServer(CONN);
+    if (!opened.ok) throw new Error('openServer failed');
+    await shim.invoke(IPC_CHANNELS.tabsUpdate, { id: opened.data.id, patch: { state: { section: 'monitor' } } });
+    const env = await shim.invoke<ServerTab[]>(IPC_CHANNELS.tabsList, undefined);
+    if (!env.ok) throw new Error(env.error.message);
+    const server = env.data.find((t) => t.kind === 'server');
+    expect(server?.state.section).toBe('monitor');
+  });
+
+  it('is removed with its Connection', async () => {
+    await openServer(CONN);
+    tmp.db.prepare('DELETE FROM connections WHERE id = ?').run(CONN);
+    expect(await listed()).toEqual([]);
   });
 });

@@ -1,16 +1,18 @@
 import React from 'react';
-import { ActionIcon, Button, Group } from '@mantine/core';
+import { ActionIcon, Button, Group, Menu, VisuallyHidden } from '@mantine/core';
 import { themeVars } from '../../theme/themeVars';
 import { copyToClipboard } from '../../utils/clipboard';
+import { COPY_FORMATS, COPY_FORMAT_LABELS, MONGOSH_HINT, formatDocsForCopy, type CopyFormat } from '../../utils/copyFormat';
 import { I } from '../../icons';
 import { useCollectionWorkspace } from './context';
 import { EMPTY_DOCUMENTS, useResultSelection } from './resultSelection';
-import { bandOccupant, resultPaneKind } from './resultPaneState';
-import {
-  buildDeleteSelectedFilterJson,
-  selectedDocs,
-  serializeSelectedForClipboard,
-} from './selection';
+import { bandOccupant, isResultStale, resultPaneKind } from './resultPaneState';
+import { formatElapsed, runProblem } from './optionPills';
+import { useRunClock } from './runClock';
+import { formatShortcut } from '../../commands/shortcutLabel';
+import { isMacRenderer } from '../../utils/platform';
+import { buildDeleteSelectedFilterJson, selectedDocs } from './selection';
+import { useCopyFormat } from './views/useCopyFormat';
 
 interface SelectionActionBarProps {
   /** Fires with the selected documents (ascending index order) when the
@@ -33,10 +35,11 @@ interface SelectionActionBarProps {
 const BAR_HEIGHT = 31;
 
 /**
- * The fixed band above the rows: a lost connection, a running find, or the
- * bulk actions for a selection (T0.4), one at a time. The outer strip always
- * renders when the workspace isn't read-only (#106 — see `BAR_HEIGHT`), so none
- * of them can move or cover a row. `ResultViewer` composes this as the
+ * The fixed band above the rows says a connection was lost, a find is running
+ * over earlier rows or was just cancelled, or the rows are not the current
+ * query's (W06 §8.2); it always renders when the workspace isn't read-only
+ * (see `BAR_HEIGHT`), so none of them can move a row. A selection's actions are a
+ * floating pill instead (W06 §8.3), and nothing fills the band while idle. `ResultViewer` composes this as the
  * `SelectionBar` slot; `ScriptTab`'s read-only snapshot composition never
  * renders it at all (AC7), and `meta.isReadOnly` is checked here too so a
  * future composition mistake can't surface destructive actions there.
@@ -47,13 +50,18 @@ export function SelectionActionBar({ onDeleteSelected, connectionLost }: Selecti
   const documents = state.lastRun?.documents ?? EMPTY_DOCUMENTS;
   const selection = useResultSelection(documents);
   const [copied, setCopied] = React.useState(false);
+  const [copyFormat, setCopyFormat] = useCopyFormat();
+  const clock = useRunClock(meta.tabId);
 
   if (meta.isReadOnly) return null;
 
+  const hasRows = resultPaneKind(state) === 'rows';
   const occupant = bandOccupant({
     lost: connectionLost !== undefined,
     // A first load has no rows to run over: `Body` shows placeholders instead.
     running: meta.isLoading && state.lastRun !== undefined,
+    cancelled: clock?.kind === 'cancelled',
+    stale: hasRows && isResultStale(state),
     selected: selection.indices.size > 0,
   });
   const docs = selectedDocs(documents, selection.indices);
@@ -62,8 +70,8 @@ export function SelectionActionBar({ onDeleteSelected, connectionLost }: Selecti
   // falling back to an unfiltered delete-everything call.
   const deleteFilterJson = buildDeleteSelectedFilterJson(docs);
 
-  const handleCopy = () => {
-    const text = serializeSelectedForClipboard(docs);
+  const handleCopy = (format: CopyFormat) => {
+    const text = formatDocsForCopy(docs, format);
     // The button's own "Copied" label is the success feedback, so it waits
     // for the write to resolve. A failure toasts and leaves the label
     // alone.
@@ -80,96 +88,174 @@ export function SelectionActionBar({ onDeleteSelected, connectionLost }: Selecti
   };
 
   return (
-    <Group
-      data-testid="selection-bar"
-      gap={themeVars.gapSm}
-      wrap="nowrap"
-      style={{
-        height: BAR_HEIGHT,
-        boxSizing: 'border-box',
-        padding: '4px 14px',
-        borderBottom: `1px solid ${T.border}`,
-        background:
-          occupant === 'selection' ? T.accentSoft : occupant === 'lost' ? T.warnSoft : 'transparent',
-        flexShrink: 0,
-        fontSize: T.fsXs,
-      }}
-    >
-      {occupant === 'lost' && connectionLost && (
-        <>
-          <span
-            role="status"
-            data-testid="band-connection-lost"
-            title={connectionLost.reason}
-            style={{
-              flex: 1,
-              minWidth: 0,
-              overflow: 'hidden',
-              textOverflow: 'ellipsis',
-              whiteSpace: 'nowrap',
-              color: T.warnText,
-            }}
-          >
-            <strong>Connection lost.</strong> {connectionLost.reason}
+    <>
+      <Group
+        data-testid="selection-bar"
+        gap={themeVars.gapSm}
+        wrap="nowrap"
+        style={{
+          height: BAR_HEIGHT,
+          boxSizing: 'border-box',
+          padding: '4px 14px',
+          borderBottom: `1px solid ${T.border}`,
+          background: occupant === 'lost' || occupant === 'stale' ? T.warnSoft : 'transparent',
+          flexShrink: 0,
+          fontSize: T.fsXs,
+        }}
+      >
+        {occupant === 'lost' && connectionLost && (
+          <>
+            <span
+              role="status"
+              data-testid="band-connection-lost"
+              title={connectionLost.reason}
+              style={{
+                flex: 1,
+                minWidth: 0,
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                whiteSpace: 'nowrap',
+                color: T.warnText,
+              }}
+            >
+              <strong>Connection lost.</strong> {connectionLost.reason}
+            </span>
+            <Button
+              size="compact-xs"
+              variant="default"
+              style={{ flexShrink: 0 }}
+              onClick={connectionLost.onReconnect}
+              disabled={connectionLost.reconnecting}
+            >
+              {connectionLost.reconnecting ? 'Reconnecting…' : 'Reconnect'}
+            </Button>
+          </>
+        )}
+        {occupant === 'running' && (
+          <>
+            {/* The status bar counts the seconds; here, what the rows are
+                meanwhile. With none on screen there is nothing to mark. */}
+            <span role="status" style={{ color: T.textMuted }}>
+              {hasRows ? 'Previous results' : 'Running…'}
+            </span>
+            <span style={{ flex: 1 }} />
+            <Button
+              data-testid="band-cancel"
+              size="compact-xs"
+              variant="subtle"
+              color="gray"
+              onClick={() => actions.cancel()}
+            >
+              Cancel
+            </Button>
+          </>
+        )}
+        {occupant === 'cancelled' && clock && (
+          <span role="status" data-testid="band-cancelled" style={{ color: T.textMuted }}>
+            Cancelled after {formatElapsed(clock.elapsedMs, true)}
+            {hasRows && ' — showing previous results'}
           </span>
-          <Button
-            size="compact-xs"
-            variant="default"
-            style={{ flexShrink: 0 }}
-            onClick={connectionLost.onReconnect}
-            disabled={connectionLost.reconnecting}
-          >
-            {connectionLost.reconnecting ? 'Reconnecting…' : 'Reconnect'}
-          </Button>
-        </>
-      )}
-      {occupant === 'running' && (
-        <>
-          <span role="status" style={{ color: T.textMuted }}>
-            Running…
-          </span>
-          <span style={{ flex: 1 }} />
-          <Button
-            data-testid="band-cancel"
-            size="compact-xs"
-            variant="subtle"
-            color="gray"
-            onClick={() => actions.cancel()}
-          >
-            Cancel
-          </Button>
-        </>
-      )}
-      {/* Only above rows: the empty, error and never-run panes have nothing to select. */}
-      {occupant === 'none' && resultPaneKind(state) === 'rows' && (
-        <span
-          data-testid="band-hint"
+        )}
+        {occupant === 'stale' && (
+          <>
+            <span
+              role="status"
+              data-testid="band-stale"
+              style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: T.warnText }}
+            >
+              These results are from the previous filter.
+            </span>
+            {/* Absent while the query cannot run as written: the Filter Bar's
+                strip gives the reason, and a Run here could only refuse. */}
+            {runProblem(state) === null && (
+              <Button
+                data-testid="band-run"
+                size="compact-xs"
+                variant="subtle"
+                style={{ flexShrink: 0 }}
+                onClick={() => actions.run()}
+              >
+                Run {formatShortcut('⌘↵', isMacRenderer())}
+              </Button>
+            )}
+          </>
+        )}
+      </Group>
+      {/* The pill mounts with its count, which a screen reader would not
+          announce, so the count is spoken from here, mounted all along. No
+          `role="status"`: the band's own status lines keep that query to themselves. */}
+      <VisuallyHidden data-testid="selection-live" aria-live="polite" aria-atomic="true">
+        {selection.indices.size > 0 ? `${selection.indices.size} selected` : ''}
+      </VisuallyHidden>
+      {/* W06 §8.3: the selection floats at the bottom centre of the canvas, over
+          the rows, so making or clearing one moves nothing. */}
+      {selection.indices.size > 0 && (
+        <Group
+          role="group"
+          aria-label="Selection"
+          data-testid="selection-pill"
+          gap={themeVars.gapXs}
+          wrap="nowrap"
           style={{
-            color: T.textGhost,
-            minWidth: 0,
-            overflow: 'hidden',
-            textOverflow: 'ellipsis',
+            position: 'absolute',
+            bottom: 16,
+            left: '50%',
+            transform: 'translateX(-50%)',
+            zIndex: 5,
+            padding: '4px 6px 4px 12px',
+            borderRadius: 999,
+            border: `1px solid ${T.border}`,
+            background: T.surfaceRaised,
+            boxShadow: T.shadowLg,
+            fontSize: T.fsXs,
             whiteSpace: 'nowrap',
           }}
         >
-          {`Select rows with the checkbox or ⌘/Ctrl-click to copy${meta.isView ? '' : ' or delete'} them`}
-        </span>
-      )}
-      {occupant === 'selection' && (
-        <>
-          <span data-testid="selection-bar-count" style={{ color: T.text, fontWeight: 600 }}>
+          <span data-testid="selection-bar-count" style={{ color: T.text, fontWeight: 600, marginRight: 4 }}>
             {selection.indices.size} selected
           </span>
-          <span style={{ flex: 1 }} />
-          <Button
-            data-testid="selection-bar-copy"
-            size="compact-xs"
-            variant="subtle"
-            leftSection={copied ? I.check : I.copy}
-            onClick={handleCopy}
-          >
-            {copied ? 'Copied' : 'Copy'}
-          </Button>
+          <Button.Group>
+            <Button
+              data-testid="selection-bar-copy"
+              size="compact-xs"
+              variant="subtle"
+              leftSection={copied ? I.check : I.copy}
+              onClick={() => handleCopy(copyFormat)}
+            >
+              {copied ? 'Copied' : 'Copy'}
+            </Button>
+            <Menu position="top" withinPortal>
+              <Menu.Target>
+                <ActionIcon
+                  data-testid="selection-bar-copy-as"
+                  variant="subtle"
+                  size="sm"
+                  aria-label="Copy as…"
+                  title="Copy as…"
+                >
+                  {I.chevD}
+                </ActionIcon>
+              </Menu.Target>
+              <Menu.Dropdown>
+                <Menu.Label>Copy as</Menu.Label>
+                {COPY_FORMATS.map((f) => (
+                  <Menu.Item
+                    key={f}
+                    rightSection={f === copyFormat ? I.check : undefined}
+                    onClick={() => {
+                      // The choice is the default from now on, so the clipboard
+                      // never holds a form the menu did not name.
+                      setCopyFormat(f);
+                      handleCopy(f);
+                    }}
+                  >
+                    {COPY_FORMAT_LABELS[f]}
+                  </Menu.Item>
+                ))}
+                <Menu.Label data-testid="copy-as-hint">mongosh: {MONGOSH_HINT}</Menu.Label>
+              </Menu.Dropdown>
+            </Menu>
+          </Button.Group>
           {!meta.isView && (
             <Button
               data-testid="selection-bar-delete"
@@ -194,8 +280,8 @@ export function SelectionActionBar({ onDeleteSelected, connectionLost }: Selecti
           >
             {I.close}
           </ActionIcon>
-        </>
+        </Group>
       )}
-    </Group>
+    </>
   );
 }

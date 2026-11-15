@@ -104,7 +104,7 @@ describe('workspace panel prefs (T4)', () => {
     // text — its disappearance is what actually proves `prefsReady` flipped,
     // rather than the collapsed-navbar affordance merely being the default.
     await waitFor(() => expect(screen.queryByText('Loading workspace…')).toBeNull());
-    expect(screen.getByRole('button', { name: 'Open navigator' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Toggle sidebar' }).getAttribute('aria-pressed')).toBe('false');
     expect(screen.queryByRole('separator', { name: 'Resize navigator' })).toBeNull();
   });
 
@@ -169,7 +169,7 @@ describe('workspace panel prefs (T4)', () => {
     await waitFor(() => expect(screen.queryByText('Loading workspace…')).toBeNull());
     // Defaults: navigator open (not collapsed), so the resize handle renders.
     expect(screen.getByRole('separator', { name: 'Resize navigator' })).toBeTruthy();
-    expect(screen.getByRole('button', { name: 'Collapse navigator' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Toggle sidebar' }).getAttribute('aria-pressed')).toBe('true');
   });
 
   it('dragging the navigator resize handle writes ui.workspace.leftWidth', async () => {
@@ -190,7 +190,8 @@ describe('workspace panel prefs (T4)', () => {
     fireEvent.mouseMove(window, { clientX: 340, clientY: 300 });
     fireEvent.mouseUp(window, { clientX: 340, clientY: 300 });
 
-    await waitFor(() => expect(set).toHaveBeenCalledWith('ui.workspace.leftWidth', 246));
+    // The default width, 240, plus the 40px drag.
+    await waitFor(() => expect(set).toHaveBeenCalledWith('ui.workspace.leftWidth', 280));
   });
 
   it('dragging the reference-drawer resize handle writes ui.workspace.refDrawerWidth', async () => {
@@ -243,7 +244,7 @@ describe('workspace panel prefs (T4)', () => {
     // rects for everything (see tests/helpers/jsdomSetup.ts's comment on
     // `getBoundingClientRect`), which the library's pointer path hit-tests against, but its
     // keyboard path resizes off stored percentages and needs no real layout.
-    const builderHandle = await screen.findByRole('separator', { name: 'Resize Query Builder' });
+    const builderHandle = await screen.findByRole('separator', { name: 'Resize inspector' });
     fireEvent.keyDown(builderHandle, { key: 'ArrowRight' });
     await waitFor(() =>
       expect(set).toHaveBeenCalledWith('ui.workspace.innerHSplit', expect.any(Number)),
@@ -251,7 +252,7 @@ describe('workspace panel prefs (T4)', () => {
 
     // Open the shell pane so its own split handle renders (Workspace.tsx
     // only mounts it while `shellOpen && focusedConnection`).
-    fireEvent.click(titleBar().getByRole('button', { name: 'Shell' }));
+    fireEvent.click(titleBar().getByRole('button', { name: 'Console' }));
     const shellHandle = await screen.findByRole('separator', { name: 'Resize shell pane' });
     fireEvent.keyDown(shellHandle, { key: 'ArrowUp' });
     await waitFor(() =>
@@ -272,12 +273,12 @@ describe('workspace panel prefs (T4)', () => {
       </MemoryRouter>,
     );
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Collapse navigator' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Toggle sidebar' }));
     await waitFor(() =>
       expect(set).toHaveBeenCalledWith('ui.workspace.sidebarCollapsed', true),
     );
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Collapse Query Builder' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Builder' }));
     await waitFor(() =>
       expect(set).toHaveBeenCalledWith('ui.workspace.builderCollapsed', true),
     );
@@ -295,18 +296,18 @@ describe('workspace panel prefs (T4)', () => {
         <Workspace />
       </MemoryRouter>,
     );
-    expect(await screen.findByRole('tablist', { name: 'Query drawer' })).toBeTruthy();
+    expect(await screen.findByRole('tablist', { name: 'Inspector view' })).toBeTruthy();
 
     fireEvent.click(screen.getByRole('tab', { name: /Aggregation/ }));
-    await waitFor(() => expect(screen.queryByRole('tablist', { name: 'Query drawer' })).toBeNull());
+    await waitFor(() => expect(screen.queryByRole('tablist', { name: 'Inspector view' })).toBeNull());
     // Hidden, not unmounted: its drafts and undo history live in the mounted pane.
-    expect(screen.getByRole('tablist', { name: 'Query drawer', hidden: true })).toBeTruthy();
-    // No notch to reopen it from here.
-    expect(screen.queryByRole('button', { name: /Query Builder$/ })).toBeNull();
+    expect(screen.getByRole('tablist', { name: 'Inspector view', hidden: true })).toBeTruthy();
+    // No Builder button to reopen it from here: the Filter Bar row is Documents'.
+    expect(screen.queryByRole('button', { name: 'Builder' })).toBeNull();
 
     fireEvent.click(screen.getByRole('tab', { name: /Documents/ }));
-    expect(await screen.findByRole('tablist', { name: 'Query drawer' })).toBeTruthy();
-    expect(screen.getByRole('button', { name: 'Collapse Query Builder' })).toBeTruthy();
+    expect(await screen.findByRole('tablist', { name: 'Inspector view' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Builder' }).getAttribute('aria-pressed')).toBe('true');
     expect(set.mock.calls.filter(([k]) => k === 'ui.workspace.builderCollapsed')).toEqual([]);
   });
 
@@ -322,17 +323,17 @@ describe('workspace panel prefs (T4)', () => {
         <Workspace />
       </MemoryRouter>,
     );
-    await screen.findByRole('tablist', { name: 'Query drawer' });
+    await screen.findByRole('tablist', { name: 'Inspector view' });
 
     fireEvent.click(screen.getByRole('tab', { name: /Aggregation/ }));
-    await waitFor(() => expect(screen.queryByRole('tablist', { name: 'Query drawer' })).toBeNull());
-    const handle = screen.getByRole('separator', { name: 'Resize Query Builder' });
+    await waitFor(() => expect(screen.queryByRole('tablist', { name: 'Inspector view' })).toBeNull());
+    const handle = screen.getByRole('separator', { name: 'Resize inspector' });
     fireEvent.pointerDown(handle);
     fireEvent.keyDown(handle, { key: 'ArrowLeft' });
 
     // Coming back restores the drawer programmatically; none of that is the user's choice.
     fireEvent.click(screen.getByRole('tab', { name: /Documents/ }));
-    await screen.findByRole('tablist', { name: 'Query drawer' });
+    await screen.findByRole('tablist', { name: 'Inspector view' });
     await new Promise((r) => setTimeout(r, 100));
     expect(set.mock.calls.filter(([k]) => k === 'ui.workspace.innerHSplit')).toEqual([]);
   });
@@ -364,11 +365,11 @@ describe('workspace panel prefs (T4)', () => {
         </MemoryRouter>,
       );
 
-      fireEvent.click(await screen.findByRole('button', { name: 'Collapse navigator' }));
+      fireEvent.click(await screen.findByRole('button', { name: 'Toggle sidebar' }));
 
       // The toggle itself still took effect locally.
       await waitFor(() =>
-        expect(screen.getByRole('button', { name: 'Open navigator' })).toBeTruthy(),
+        expect(screen.getByRole('button', { name: 'Toggle sidebar' }).getAttribute('aria-pressed')).toBe('false'),
       );
       // Let the rejected write's microtask actually run before checking.
       await new Promise((resolve) => setTimeout(resolve, 0));
@@ -418,5 +419,40 @@ describe('useWorkspacePanelPrefs — a layout setting that could not be saved sa
 
     expect(result.current.sidebarCollapsed).toBe(true);
     expect(await screen.findByText('Could not save the layout')).toBeTruthy();
+  });
+});
+
+// W15 §16 — the Query Builder is closed until the user opens it: the Filter Bar
+// row carries the query, and a first launch has stored no choice yet.
+describe('useWorkspacePanelPrefs — the Query Builder is closed by default', () => {
+  afterEach(() => uninstallAtelierMock());
+
+  async function mountWith(stored: boolean | null) {
+    const set = vi.fn(async () => undefined);
+    installAtelierMock({
+      prefs: {
+        get: (async (key: string) => (key === 'ui.workspace.builderCollapsed' ? stored : null)) as never,
+        set: set as never,
+      },
+    });
+    const hook = renderHook(() => useWorkspacePanelPrefs());
+    await waitFor(() => expect(hook.result.current.prefsReady).toBe(true));
+    return { ...hook, set };
+  }
+
+  it.each([
+    ['no stored choice', null, true],
+    ['a stored open builder', false, false],
+    ['a stored closed builder', true, true],
+  ])('with %s', async (_what, stored, collapsed) => {
+    const { result } = await mountWith(stored);
+    expect(result.current.builderCollapsed).toBe(collapsed);
+  });
+
+  it('opening it is stored, so the next launch opens on it', async () => {
+    const { result, set } = await mountWith(null);
+    act(() => result.current.commitBuilderCollapsed(false));
+    expect(result.current.builderCollapsed).toBe(false);
+    expect(set).toHaveBeenCalledWith('ui.workspace.builderCollapsed', false);
   });
 });

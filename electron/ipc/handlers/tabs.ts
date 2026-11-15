@@ -40,9 +40,13 @@ const TabStateShape = z
     columns: z.record(z.string(), z.object({ width: z.number() })).optional(),
     expandedRows: z.record(z.string(), z.boolean()).optional(),
     activeBuilderTab: z.string().optional(),
+    optionsExpanded: z.boolean().optional(),
+    jsonDisplay: z.enum(['shell', 'canonical']).optional(),
     referenceDrawer: z.record(z.string(), z.unknown()).optional(),
     aggregation: z.record(z.string(), z.unknown()).optional(),
     schema: z.record(z.string(), z.unknown()).optional(),
+    // ─── ServerTabState ────────────────────────────────────────────
+    section: z.enum(['overview', 'monitor', 'collections', 'users', 'roles']).optional(),
     // ─── ScriptTabState ────────────────────────────────────────────
     title: z.string().optional(),
     source: z.string().optional(),
@@ -92,6 +96,8 @@ const OpenScriptInput = z.object({
   connectionId: NonEmpty,
   initialState: TabStateShape.optional(),
 });
+
+const OpenServerInput = z.object({ connectionId: NonEmpty });
 
 const UpdateInput = z.object({
   id: NonEmpty,
@@ -150,6 +156,12 @@ export function registerTabsChannels(
     zodValidator(OpenScriptInput),
     (input) =>
       svc.openScript(input as Parameters<typeof svc.openScript>[0]),
+  );
+
+  router.register(
+    IPC_CHANNELS.tabsOpenServer,
+    zodValidator(OpenServerInput),
+    (input) => svc.openServer(input),
   );
 
   router.register(

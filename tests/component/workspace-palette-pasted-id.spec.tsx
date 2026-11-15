@@ -69,7 +69,7 @@ function search(q: string) {
   fireEvent.change(screen.getByLabelText('Search commands'), { target: { value: q } });
 }
 
-const filterBar = () => screen.getByLabelText('Query filter') as HTMLTextAreaElement;
+const filterBar = () => screen.getByLabelText('Filter', { selector: 'textarea' }) as HTMLTextAreaElement;
 
 afterEach(() => {
   commandRegistry._resetForTests();
@@ -81,7 +81,7 @@ afterEach(() => {
 describe('palette: a pasted _id with a collection tab in front', () => {
   it.each([HEX, `ObjectId("${HEX}")`, `ObjectId('${HEX}')`])('offers the row first for %s', async (query) => {
     mount([collectionTab()]);
-    await screen.findByLabelText('Query filter');
+    await screen.findByLabelText('Filter', { selector: 'textarea' });
     search(query);
 
     const dialog = within(screen.getByRole('dialog'));
@@ -108,7 +108,7 @@ describe('palette: a pasted _id with a collection tab in front', () => {
 
   it('is absent for a query that is not an id', async () => {
     mount([collectionTab()]);
-    await screen.findByLabelText('Query filter');
+    await screen.findByLabelText('Filter', { selector: 'textarea' });
     search(HEX.slice(1));
     await screen.findByLabelText('Search commands');
     expect(within(screen.getByRole('dialog')).queryByText(/Find _id/)).toBeNull();
@@ -116,7 +116,10 @@ describe('palette: a pasted _id with a collection tab in front', () => {
 
   it('Enter filters the tab to the document, runs it, and Undo puts the old filter back', async () => {
     const { find } = mount([collectionTab()]);
-    await screen.findByLabelText('Query filter');
+    await screen.findByLabelText('Filter', { selector: 'textarea' });
+    // The restored tab runs its own filter once at launch; what follows is the palette's.
+    await waitFor(() => expect(find).toHaveBeenCalledTimes(1));
+    find.mockClear();
     search(`ObjectId("${HEX}")`);
     await within(screen.getByRole('dialog')).findByText('In the tab in front');
     fireEvent.keyDown(screen.getByLabelText('Search commands'), { key: 'Enter' });
@@ -138,7 +141,7 @@ describe('palette: a pasted _id with a collection tab in front', () => {
     const tab = collectionTab();
     const { find } = mount([{ ...tab, state: { ...tab.state, activeView: 'aggregation' } } as WorkspaceTab]);
     await screen.findByRole('tab', { name: 'Aggregation', selected: true });
-    expect(screen.queryByLabelText('Query filter')).toBeNull();
+    expect(screen.queryByLabelText('Filter', { selector: 'textarea' })).toBeNull();
     search(HEX);
     await within(screen.getByRole('dialog')).findByText('In the tab in front');
     fireEvent.keyDown(screen.getByLabelText('Search commands'), { key: 'Enter' });
@@ -151,9 +154,12 @@ describe('palette: a pasted _id with a collection tab in front', () => {
 
   it('keeps the step for a drawer that was collapsed when the filter was replaced', async () => {
     const { find } = mount([collectionTab()]);
-    await screen.findByLabelText('Query filter');
+    await screen.findByLabelText('Filter', { selector: 'textarea' });
+    // The restored tab runs its own filter once at launch; what follows is the palette's.
+    await waitFor(() => expect(find).toHaveBeenCalledTimes(1));
+    find.mockClear();
     // Ctrl+B collapses the query drawer.
-    fireEvent.keyDown(window, { key: 'b', ctrlKey: true });
+    fireEvent.keyDown(window, { key: 'B', ctrlKey: true, shiftKey: true });
     await waitFor(() => expect(screen.queryByRole('button', { name: 'Undo filter edit' })).toBeNull());
 
     search(HEX);
@@ -163,7 +169,7 @@ describe('palette: a pasted _id with a collection tab in front', () => {
     expect(filterBar().value).toBe(FILTER);
 
     // Expanding the drawer afterwards still has the old filter one Undo away.
-    fireEvent.keyDown(window, { key: 'b', ctrlKey: true });
+    fireEvent.keyDown(window, { key: 'B', ctrlKey: true, shiftKey: true });
     const undo = (await screen.findByRole('button', { name: 'Undo filter edit' })) as HTMLButtonElement;
     expect(undo.disabled).toBe(false);
     fireEvent.click(undo);
@@ -183,7 +189,7 @@ describe('palette: a pasted _id with a collection tab in front', () => {
       },
     };
     mount([collectionTab(BEFORE, draft)]);
-    await screen.findByLabelText('Query filter');
+    await screen.findByLabelText('Filter', { selector: 'textarea' });
     expect(screen.queryByDisplayValue('offrow')).toBeTruthy();
 
     search(HEX);

@@ -11,7 +11,7 @@ test.afterAll(stopAllMemoryServers);
 
 /**
  * C04 — Test-connection probe: failing probe shows an error, passing probe
- * shows "Connection successful".
+ * shows "Connected in N ms".
  */
 test('test probe: failure shows error, valid host/port shows success', async () => {
   const { host, port } = await startMemoryServer();
@@ -22,7 +22,7 @@ test('test probe: failure shows error, valid host/port shows success', async () 
 
     await expectConsoleClean(win, async () => {
       const switcher = new WorkspacePage(win).switcher;
-      await switcher.waitVisible();
+      await switcher.waitWelcome();
       await switcher.openNew();
 
       const form = new NewConnectionPage(win);
@@ -49,7 +49,7 @@ test('test probe: failure shows error, valid host/port shows success', async () 
       await form.hostnameInput.fill(host);
       await form.portInput.fill(String(port));
       await form.testButton.click();
-      await expect(win.getByText('Connection successful')).toBeVisible({ timeout: 10000 });
+      await expect(win.getByText(/Connected in \d+ ms/)).toBeVisible({ timeout: 10000 });
     });
   });
 });

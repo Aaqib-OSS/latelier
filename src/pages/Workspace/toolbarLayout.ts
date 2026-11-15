@@ -1,65 +1,115 @@
 /**
  * Which form each results toolbar takes at a given width. These functions take
- * the bar's width and nothing else on purpose: a stale query, a run in flight or
- * results arriving cannot change a control's form, because they cannot reach here.
+ * the bar's width and the few things that size a control (whether References is
+ * there, the total's length) and nothing else on purpose: a stale query, a run
+ * in flight or results arriving cannot change a control's form, because they
+ * cannot reach here.
  *
  * Null means the width is not known (no layout, as in jsdom): room for everything.
  *
- * The numbers are the widest the bar's fixed parts can be at each step, measured
- * in the running app at the theme's control sizes. Whatever is left over goes to
- * the count, which truncates before any control moves.
+ * The numbers are measured in the app at the theme's control sizes. Whatever is
+ * left over goes to the count, which truncates before any control moves.
  */
-
-export type CountForm = 'full' | 'range' | 'total';
-
-export interface ResultBarLayout {
-  /** full: "60 results · 2 ms · showing 1–50". range: "1–50 of 60". total: "60 results". */
-  count: CountForm;
-  /** Fields, Insert and Documents as icons with tooltips. The view switch keeps its words. */
-  iconControls: boolean;
-  /** The query-plan badge takes count room the narrowest bars do not have. */
-  planBadge: boolean;
-  /** Reachable only by dragging the panes: two rows beat clipping. */
-  wrap: boolean;
-}
-
-const COUNT_FULL_MIN = 900;
-const COUNT_RANGE_MIN = 640;
-const LABELS_MIN = 760;
-const PLAN_BADGE_MIN = 640;
-const ONE_ROW_MIN = 500;
-// The References control, measured with its gap: as a labelled button, then as an icon.
-const REFERENCES_LABEL_WIDTH = 141;
-const REFERENCES_ICON_WIDTH = 32;
 
 /**
- * `withReferences` is a control, not the query: the workspace tab shows the
- * References button and previews do not, so the tab's steps sit that much wider.
+ * The total as the count and the pager label write it: `6,382`, or `6,382+`
+ * while the find has more and no count has come back. An uncounted total is
+ * only a lower bound, so the caller passes the end of the range shown, not the
+ * page's own document count.
  */
-export function resultBarLayout(width: number | null, withReferences = false): ResultBarLayout {
-  const w = width ?? Number.POSITIVE_INFINITY;
-  const labelled = withReferences ? w - REFERENCES_LABEL_WIDTH : w;
-  const iconic = withReferences ? w - REFERENCES_ICON_WIDTH : w;
-  const iconControls = labelled < LABELS_MIN;
-  let count: CountForm = 'total';
-  if (labelled >= COUNT_FULL_MIN) count = 'full';
-  else if ((iconControls ? iconic : labelled) >= COUNT_RANGE_MIN) count = 'range';
-  return {
-    count,
-    iconControls,
-    planBadge: iconic >= PLAN_BADGE_MIN,
-    wrap: iconic < ONE_ROW_MIN,
-  };
+export function totalLabelText(totalCount: number | undefined, rangeEnd: number, hasMore: boolean): string {
+  return `${(totalCount ?? rangeEnd).toLocaleString()}${hasMore && totalCount === undefined ? '+' : ''}`;
 }
 
-export type OutputBarActions = 'labels' | 'icons' | 'menu';
+const DIGIT = 7.8; // a figure
+const SEPARATOR = 3.4; // a thousands separator
+const DASH_AND_OF = 18; // the en dash and " of "
+const ICON = 22; // an ActionIcon, and every pager button
+const MORE = 22;
+const INSERT_LABEL = 78;
+const REFERENCES_LABEL = 134;
+const SWITCH_LABELS = 150;
+const SWITCH_ICONS = 90;
+const PAGE_SIZE = 56; // the select and its margin
+const PADDING = 28;
 
-const OUTPUT_LABELS_MIN = 760;
-const OUTPUT_ICONS_MIN = 520;
+/**
+ * Room the widest page label ("123,451–123,456 of 123,456") takes for this
+ * total. Anything that is not a figure or a `+` counts as a separator, so a
+ * locale with a narrow-space separator measures the same.
+ */
+export function pageLabelWidth(total: string): number {
+  const figures = [...total].filter((c) => /[\d+]/.test(c)).length;
+  return Math.ceil(3 * figures * DIGIT + 3 * (total.length - figures) * SEPARATOR + DASH_AND_OF);
+}
 
-/** The aggregation output bar: labels, then icons, then one menu for all four actions. */
-export function outputBarActions(width: number | null): OutputBarActions {
+/**
+ * The canvas header (W06 §8.1): the view switch, the count and pager, References,
+ * `⋯` and Insert. Its steps, in the order they are taken as the bar narrows:
+ * References and Insert as icons, no First and Last, no page size, the view
+ * switch as icons, and last the page label's reserved width.
+ */
+export interface CanvasHeaderLayout {
+  /** References and Insert as icons with tooltips. */
+  iconControls: boolean;
+  /** The pager's First and Last buttons. */
+  pagerEnds: boolean;
+  /** The rows-per-page select. Previous and Next always stay. */
+  pageSize: boolean;
+  /** The view switch as three icons (each keeps its name for assistive tech). */
+  compactViews: boolean;
+  /** The page label keeps the room its widest text needs, so Next holds still. */
+  labelReserve: boolean;
+}
+
+const FORMS: CanvasHeaderLayout[] = [
+  { iconControls: false, pagerEnds: true, pageSize: true, compactViews: false, labelReserve: true },
+  { iconControls: true, pagerEnds: true, pageSize: true, compactViews: false, labelReserve: true },
+  { iconControls: true, pagerEnds: false, pageSize: true, compactViews: false, labelReserve: true },
+  { iconControls: true, pagerEnds: false, pageSize: false, compactViews: false, labelReserve: true },
+  { iconControls: true, pagerEnds: false, pageSize: false, compactViews: true, labelReserve: true },
+  { iconControls: true, pagerEnds: false, pageSize: false, compactViews: true, labelReserve: false },
+];
+
+// What the count keeps beside a form: the whole "123,456 documents · 1234 ms"
+// beside the widest form, and a truncated figure beside the rest.
+const COUNT_FULL = 150;
+const COUNT_MIN = 80;
+
+/** The widest the bar's fixed parts get in `form`, gaps and padding included. */
+function fixedWidth(form: CanvasHeaderLayout, withReferences: boolean, labelWidth: number): number {
+  const gap = form.iconControls ? 6 : 8;
+  const items = withReferences ? 3 : 2;
+  const references = withReferences ? (form.iconControls ? ICON : REFERENCES_LABEL) : 0;
+  const right = references + MORE + (form.iconControls ? ICON : INSERT_LABEL) + (items - 1) * gap;
+  const pager =
+    2 * ICON + (form.pagerEnds ? 2 * ICON : 0) + (form.pageSize ? PAGE_SIZE : 0) + (form.labelReserve ? labelWidth : 0);
+  return PADDING + (form.compactViews ? SWITCH_ICONS : SWITCH_LABELS) + 3 * gap + right + pager;
+}
+
+/**
+ * The first form whose fixed parts leave the count its room; the last form
+ * when none does. `withReferences` is a control, not the query: the workspace
+ * tab shows the References button and previews do not.
+ */
+export function canvasHeaderLayout(width: number | null, withReferences = false, total = ''): CanvasHeaderLayout {
   const w = width ?? Number.POSITIVE_INFINITY;
-  if (w >= OUTPUT_LABELS_MIN) return 'labels';
-  return w >= OUTPUT_ICONS_MIN ? 'icons' : 'menu';
+  const label = pageLabelWidth(total);
+  const fits = FORMS.find((f, i) => w - fixedWidth(f, withReferences, label) >= (i === 0 ? COUNT_FULL : COUNT_MIN));
+  return fits ?? FORMS[FORMS.length - 1]!;
+}
+
+/** The count's slot in the result bar (W01 §14.6): the width it gets is the count's own. */
+export interface StatusCountLayout {
+  /** The query-plan badge takes count room the narrowest bars do not have. */
+  planBadge: boolean;
+}
+
+// The count ("6,382+ documents · 1234 ms", about 150 wide at the band's 11px
+// text) has one form; the plan badge's 44px minimum beside it is what gives way.
+const PLAN_BADGE_MIN = 200;
+
+export function statusCountLayout(width: number | null): StatusCountLayout {
+  const w = width ?? Number.POSITIVE_INFINITY;
+  return { planBadge: w >= PLAN_BADGE_MIN };
 }

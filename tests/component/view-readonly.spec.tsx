@@ -11,6 +11,7 @@ import {
 } from '../helpers/render';
 import { installAtelierMock, uninstallAtelierMock } from '../helpers/atelierMock';
 import { ResultBar } from '../../src/pages/Workspace/ResultBar';
+import { StatusBar } from '../../src/pages/Workspace/StatusBar';
 import { ResultViewer } from '../../src/pages/Workspace/ResultViewer';
 import { TreeView } from '../../src/pages/Workspace/views/TreeView';
 import { JsonView } from '../../src/pages/Workspace/views/JsonView';
@@ -54,12 +55,12 @@ function withProvider(view: CollectionTabState['view'], isView: boolean, childre
 
 describe.each([true, false])('result bar writes, isView=%s', (isView) => {
   it('offers Insert and the write items of the Documents menu only on a collection', async () => {
-    withProvider('Tree', isView, <ResultBar />);
+    withProvider('Tree', isView, <><StatusBar connection={null} /><ResultBar /></>);
     expect(!!screen.queryByRole('button', { name: 'Insert document' })).toBe(!isView);
-    await userEvent.click(screen.getByRole('button', { name: /Documents/ }));
-    expect(!!screen.queryByText('Update all matching…')).toBe(!isView);
-    expect(!!screen.queryByText('Import documents…')).toBe(!isView);
-    expect(!!screen.queryByText('Delete all matching…')).toBe(!isView);
+    await userEvent.click(screen.getByRole('button', { name: 'More actions' }));
+    expect(!!screen.queryByText('Update matching…')).toBe(!isView);
+    expect(!!screen.queryByText('Import…')).toBe(!isView);
+    expect(!!screen.queryByText('Delete matching…')).toBe(!isView);
     // Reading a view's documents out is not a write.
     expect(screen.getByText('Export…')).toBeTruthy();
   });
@@ -86,10 +87,13 @@ describe.each([
     expect(actions.openEdit).toHaveBeenCalledTimes(1);
   });
 
-  it('on a collection: Edit, Delete and Duplicate stay', async () => {
+  it('on a collection: Edit stays on the row, Delete and Duplicate in the menu', async () => {
     withProvider(name, false, node);
     expect(screen.getByRole('button', { name: /^Edit document/ })).toBeTruthy();
-    expect(screen.getByRole('button', { name: /^Delete document/ })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /^Delete document/ })).toBeNull();
+    fireEvent.click(screen.getAllByRole('button', { name: /^More actions for document/ })[0]);
+    expect(await screen.findByRole('menuitem', { name: 'Delete' })).toBeTruthy();
+    expect(screen.getByRole('menuitem', { name: 'Edit document' })).toBeTruthy();
     expect(screen.queryByText('View document')).toBeNull();
   });
 });
@@ -107,7 +111,7 @@ describe('selection bar', () => {
         <ResultViewer.Json />
       </ResultViewer>,
     );
-    fireEvent.click(screen.getByRole('button', { name: 'Select document 99439011' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Select document …99439011' }));
     expect(screen.getByTestId('selection-bar-copy')).toBeTruthy();
     expect(!!screen.queryByTestId('selection-bar-delete')).toBe(hasDelete);
   });
@@ -128,7 +132,7 @@ describe('empty view', () => {
       </CollectionWorkspaceProvider>,
     );
     expect(screen.getByText('This collection is empty')).toBeTruthy();
-    expect(screen.queryByText('Import documents…')).toBeNull();
+    expect(screen.queryByText('Import…')).toBeNull();
   });
 });
 
@@ -150,6 +154,7 @@ describe('useDocumentDialogs on a view', () => {
         queryRunner: { run: () => Promise.resolve(), cancel: () => {}, isLoading: false, isRunning: () => false },
         activeTabId: 't1',
         resolveRunnerTarget: () => null,
+        resolveNamespaceTargets: () => [],
         readOnly: false,
         isView,
       }),

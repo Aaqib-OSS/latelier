@@ -53,7 +53,7 @@ test('COLLSCAN find -> Explain -> Create an index -> Structure lists it -> re-ex
       // The first run is `{}`: a scan is the only plan an empty filter has, so
       // the result bar does not flag it.
       const planBadge = win.getByTestId('plan-badge');
-      await expect(win.getByText(/^\d+–\d+ of/).first()).toBeVisible({ timeout: 8000 });
+      await expect(win.getByTestId('result-count-slot')).toContainText(/\d+ documents · \d+ ms/, { timeout: 8000 });
       await expect(planBadge).toHaveCount(0);
 
       // A filter with no supporting index — explains to COLLSCAN, and the badge says so.
@@ -61,9 +61,9 @@ test('COLLSCAN find -> Explain -> Create an index -> Structure lists it -> re-ex
       await ws.queryBarRunButton.click();
       await expect(planBadge).toHaveText('no index', { timeout: 8000 });
       await ws.queryBarRunOptionsButton.click();
-      await win.getByRole('menuitem', { name: 'queryPlanner' }).click();
+      await win.getByRole('menuitem', { name: 'Explain plan' }).click();
 
-      const explainDrawer = win.getByRole('dialog', { name: 'Explain plan' });
+      const explainDrawer = win.getByTestId('inspector');
       await expect(explainDrawer).toBeVisible({ timeout: 8000 });
       await expect(explainDrawer).toContainText('COLLSCAN', { timeout: 8000 });
 
@@ -71,9 +71,9 @@ test('COLLSCAN find -> Explain -> Create an index -> Structure lists it -> re-ex
       await expect(createIndexBtn).toBeVisible();
       await createIndexBtn.click();
 
-      // The explain drawer closes and Structure becomes the active sub-tab.
+      // The Inspector closes and Structure becomes the active sub-tab.
       await expect(explainDrawer).not.toBeVisible({ timeout: 4000 });
-      await expect(win.getByRole('tab', { name: /Structure/ })).toHaveAttribute(
+      await expect(win.getByRole('tab', { name: /Schema & indexes/ })).toHaveAttribute(
         'aria-selected',
         'true',
       );
@@ -106,12 +106,55 @@ test('COLLSCAN find -> Explain -> Create an index -> Structure lists it -> re-ex
       await expect(planBadge).toHaveText('status_1', { timeout: 8000 });
 
       await ws.queryBarRunOptionsButton.click();
-      await win.getByRole('menuitem', { name: 'queryPlanner' }).click();
+      await win.getByRole('menuitem', { name: 'Explain plan' }).click();
 
-      const reExplainDrawer = win.getByRole('dialog', { name: 'Explain plan' });
+      const reExplainDrawer = win.getByTestId('inspector');
       await expect(reExplainDrawer).toBeVisible({ timeout: 8000 });
       await expect(reExplainDrawer).toContainText('IXSCAN', { timeout: 8000 });
       await expect(reExplainDrawer.getByTestId('explain-create-index')).not.toBeVisible();
+    });
+  });
+});
+
+/** W16 §16.6 — a schema row's menu opens the create drawer on that field. */
+test('Schema row menu -> Create index on this field -> drawer prefilled -> index listed', async () => {
+  const { host, port } = await startMemoryServer();
+
+  await withApp(async (app) => {
+    const win = await app.firstWindow();
+    await win.waitForLoadState('domcontentloaded');
+
+    await expectConsoleClean(win, async () => {
+      await seedActiveConnectionWithDocs(
+        win,
+        { ...baseConnInput(host, port), name: 'Schema Row Index Target' },
+        {
+          dbName: 'shop',
+          collection: 'orders',
+          docs: [
+            { sku: 'apple-001', status: 'paid' },
+            { sku: 'banana-002', status: 'pending' },
+          ],
+        },
+      );
+      await expectStatusDot(win, 'Schema Row Index Target', 'connected');
+
+      const ws = new WorkspacePage(win);
+      await ws.openCollectionFromNavigator('shop', 'orders');
+      await ws.tablist.getByRole('tab', { name: 'Schema & indexes' }).click();
+
+      await win.getByRole('button', { name: 'Actions for sku' }).click();
+      await win.getByRole('menuitem', { name: 'Create index on this field' }).click();
+
+      const createDrawer = win.getByRole('dialog', { name: /New index/ });
+      await expect(createDrawer).toBeVisible({ timeout: 8000 });
+      await expect(createDrawer.getByLabel('Field 1', { exact: true })).toHaveValue('sku');
+
+      await createDrawer.getByRole('button', { name: 'Create index' }).click();
+      await expect(createDrawer).not.toBeVisible({ timeout: 8000 });
+      await expect(
+        win.getByRole('region', { name: 'Indexes' }).getByText('sku_1', { exact: true }),
+      ).toBeVisible({ timeout: 8000 });
     });
   });
 });

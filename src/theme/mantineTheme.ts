@@ -9,6 +9,7 @@ import {
   Input,
   InputWrapper,
   keys,
+  Modal,
   SegmentedControl,
   Tooltip,
   type VariantColorsResolver,
@@ -113,6 +114,7 @@ export const cssVariablesResolver: CSSVariablesResolver = (theme) => {
     },
     dark: {
       ...darkLight,
+      '--mantine-color-body': 'var(--atelier-bg)',
       '--mantine-color-placeholder': 'var(--atelier-text-ghost)',
       '--mantine-color-default-color': 'var(--atelier-text)',
       '--mantine-color-disabled': 'transparent',
@@ -193,6 +195,16 @@ export const mantineTheme: MantineThemeOverride = createTheme({
     Tooltip: Tooltip.extend({
       defaultProps: {
         events: { hover: true, focus: true, touch: false },
+      },
+    }),
+
+    // A dialog is drawn on the panel tone, not the body variable: in dark that
+    // variable is the canvas tone, which left a dialog indistinguishable from
+    // the canvas behind its overlay (X10). In light the two are both white.
+    Modal: Modal.extend({
+      styles: {
+        content: { background: 'var(--atelier-surface)' },
+        header: { background: 'var(--atelier-surface)' },
       },
     }),
 

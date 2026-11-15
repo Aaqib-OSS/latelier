@@ -219,7 +219,7 @@ test('table: Shift+F10 opens the row menu after the wheel scrolled the active ro
     await expect(grid).toBeFocused();
 
     await win.keyboard.press('Shift+F10');
-    await expect(win.getByRole('group', { name: 'Cell actions' })).toBeVisible();
+    await expect(win.getByRole('menu')).toBeVisible();
     await expect(row(0)).toBeInViewport();
   }));
 
@@ -419,13 +419,12 @@ test('tree roving focus: Tab crosses a 50-row page in one stop for the tree plus
       stops.push(here);
     }
 
-    expect(stops).toHaveLength(6);
-    expect(stops.slice(1).map((s) => s.row)).toEqual(Array(5).fill('tree-row-0'));
+    expect(stops).toHaveLength(5);
+    expect(stops.slice(1).map((s) => s.row)).toEqual(Array(4).fill('tree-row-0'));
     expect(stops.slice(1).map((s) => s.label)).toEqual([
       expect.stringMatching(/^Select document /),
       'Expand document',
       expect.stringMatching(/^Edit document /),
-      expect.stringMatching(/^Delete document /),
       expect.stringMatching(/^More actions for document /),
     ]);
 
@@ -503,7 +502,7 @@ test('tree: D opens the delete confirmation on Cancel, and focus returns to the 
     await win.keyboard.press('ArrowDown');
 
     await win.keyboard.press('d');
-    const dialog = win.getByRole('dialog', { name: 'Delete document?' });
+    const dialog = win.getByRole('dialog', { name: /^Delete document from / });
     await expect(dialog).toBeVisible();
     await expect(dialog.getByRole('button', { name: 'Cancel' })).toBeFocused();
 
@@ -535,7 +534,7 @@ test('tree: D typed into a text field types the letter and deletes nothing', asy
     await win.keyboard.press('d');
 
     await expect(field).toHaveValue('d');
-    await expect(win.getByRole('dialog', { name: 'Delete document?' })).toHaveCount(0);
+    await expect(win.getByRole('dialog', { name: /^Delete document from / })).toHaveCount(0);
   }));
 
 test('field tree roving focus: a real click on a field row does not trap focus — ArrowDown still moves the field tree', async () =>

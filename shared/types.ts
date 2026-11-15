@@ -174,6 +174,8 @@ export interface ConnectionSummary {
   defaultDb?: string;
   status: 'unknown' | 'connected' | 'disconnected' | 'connecting' | 'error';
   serverVersion?: string;
+  /** When the live client connected; absent while not connected. */
+  connectedAt?: string;
   readOnly: boolean;
   /** See `ConnectionRuntime.lostReason`. */
   lostReason?: string;
@@ -898,6 +900,16 @@ export interface CollectionTabState {
   /** Table-view column show/hide/reorder/computed config (T2.5). */
   columnConfig?: TableColumnConfig;
   activeBuilderTab: BuilderTab;
+  /**
+   * W05 §9.2 "Keep options expanded": the query options show as the grid under
+   * the Filter Bar row instead of as pills. Per tab, and off unless set.
+   */
+  optionsExpanded?: boolean;
+  /**
+   * How the JSON view writes a document: shell form (`ObjectId("…")`, the
+   * default) or Canonical EJSON. Display only; copying has its own format.
+   */
+  jsonDisplay?: 'shell' | 'canonical';
   /** Persisted reference-drawer stack; restored when the user revisits this tab. */
   referenceDrawer?: PersistedDrawerState;
   /** Aggregation sub-view state. Lazily populated when the user opens it. */
@@ -917,6 +929,10 @@ export interface AggregationLastRun {
   stageSamples: Record<number, unknown[]>;
   hasMore?: boolean;
   error?: LastRunError;
+  /** `pipelineSigs(...).byStage` of the run, so a later edit can mark its counts and samples stale. Renderer-only, like the run itself. */
+  stageSigs?: Record<number, string>;
+  /** `pipelineSigs(...).pipeline` of the run, for the Output row's staleness. */
+  pipelineSig?: string;
 }
 
 export interface AggregationTabState {
@@ -1025,7 +1041,21 @@ export interface ScriptTab extends WorkspaceTabBase {
   state: ScriptTabState;
 }
 
-export type WorkspaceTab = CollectionTab | ScriptTab;
+export type ServerSection = 'overview' | 'monitor' | 'collections' | 'users' | 'roles';
+
+export interface ServerTabState {
+  section: ServerSection;
+}
+
+/** One per Connection (C05 §11). `dbName` / `collection` are empty, as for a script tab. */
+export interface ServerTab extends WorkspaceTabBase {
+  kind: 'server';
+  dbName: string;
+  collection: string;
+  state: ServerTabState;
+}
+
+export type WorkspaceTab = CollectionTab | ScriptTab | ServerTab;
 
 // ─── Script tab IPC (W12) ───────────────────────────────────────────────────
 

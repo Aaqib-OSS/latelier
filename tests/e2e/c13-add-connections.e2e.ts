@@ -7,7 +7,7 @@ import { wizardDialog } from './helpers/importWizard';
 
 /**
  * C13 §7–8 through the C14 Import Wizard — paste connection strings into the
- * Connections table's "Paste URIs" (one complete, one missing its credentials,
+ * Connections table's "Import ▾ → Paste URIs…" (one complete, one missing its credentials,
  * one bad), type the missing credentials in the final approval, connect with
  * them, then check both rows and delete them in one batch without the table
  * closing.
@@ -61,9 +61,8 @@ test('add Connections from pasted strings, with typed credentials, then batch-de
     });
 
     const switcher = new WorkspacePage(win).switcher;
-    await switcher.openExpandedTable();
-    const table = switcher.expandedTableDialog;
-    await table.getByRole('button', { name: 'Paste URIs' }).click();
+    // No Connection is saved, so the welcome canvas (C03 §13.1) is the entry to the wizard.
+    await win.getByRole('button', { name: 'Paste several URIs' }).click();
 
     const wizard = wizardDialog(win);
     await wizard.getByRole('textbox', { name: 'Or paste connection strings' }).fill(
@@ -93,7 +92,9 @@ test('add Connections from pasted strings, with typed credentials, then batch-de
     await wizard.getByRole('button', { name: 'Done' }).click();
     await expect(wizard).toBeHidden();
 
-    // The table stayed open underneath, and now lists both.
+    // Both are listed in the Connections table.
+    await switcher.openExpandedTable();
+    const table = switcher.expandedTableDialog;
     await expect(table.getByText(`${host} (2)`, { exact: true })).toBeVisible();
     const typed = await win.evaluate(async (name) => {
       const api = (window as unknown as { atelier: Atelier }).atelier;

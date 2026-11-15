@@ -1,4 +1,5 @@
 import { test, expect, type Page } from '@playwright/test';
+import { MongoClient } from 'mongodb';
 import { baseConnInput, startMemoryServer, stopAllMemoryServers, withApp } from '../helpers/e2eApp';
 import { WorkspacePage } from './pages';
 import { seedActiveConnectionWithDocs } from './helpers/uiSeed';
@@ -64,10 +65,10 @@ function countIsCut(win: Page): Promise<boolean> {
 async function expectQueryRowWhole(win: Page, label: string, withNotice = false) {
   const actions = win.getByTestId('query-bar-actions');
   if (withNotice) {
-    // A refused ⌘↵ puts its reason beside Run: the case that could squeeze the row.
+    // A refused ⌘↵ puts its reason in the strip under the row (W05 §9.3): the row keeps its room.
     await win.getByTestId('query-bar-input').focus();
     await win.keyboard.press('ControlOrMeta+Enter');
-    await expect(actions.locator('[role="alert"]').first(), `${label}: notice`).toBeVisible();
+    await expect(win.getByTestId('query-bar-strip'), `${label}: notice`).toBeVisible();
   }
   const row = await readBar(win, 'query-bar-actions');
   expect(row.clipped, `${label}: query row clipped`).toEqual([]);
@@ -117,7 +118,16 @@ test('results toolbar never clips, and a stale query changes nothing about it', 
         const fresh = await readBar(win, 'result-bar');
         expect(fresh.overflow, `${width}: bar overflow`).toBeLessThanOrEqual(0);
         expect(fresh.clipped, `${width}: clipped`).toEqual([]);
-        expect(fresh.barHeight, `${width}: one row`).toBe(44);
+        expect(fresh.barHeight, `${width}: one row`).toBe(28);
+        // The count and pager sit in this row (W01 §14.6): the pager's buttons are in the read above.
+        for (const name of ['Previous page', 'Next page', 'Rows per page']) {
+          await expect(win.getByTestId('result-bar').getByLabel(name, { exact: true }).first(), `${width}: ${name}`).toBeVisible();
+        }
+        // The status bar keeps the connection and nothing of the results.
+        await expect(win.getByTestId('status-bar').getByTestId('page-label'), `${width}: pager in status bar`).toHaveCount(0);
+        const status = await readBar(win, 'status-bar');
+        expect(status.overflow, `${width}: status bar overflow`).toBeLessThanOrEqual(0);
+        expect(status.barHeight, `${width}: status bar height`).toBeLessThanOrEqual(24);
         expect(await countIsCut(win), `${width}: count cut`).toBe(false);
         await expectQueryRowWhole(win, `${width}`);
 
@@ -161,7 +171,7 @@ test('the page-reset hint beside Run leaves the filter its room at 960', async (
       await win.waitForTimeout(300);
       // 60 docs at 50 a page: page 2, then an edit that would send Run back to page 1.
       await win.getByRole('button', { name: 'Next page', exact: true }).click();
-      await expect(win.getByTestId('result-bar')).toContainText('2 / 2', { timeout: 8000 });
+      await expect(win.getByTestId('result-bar')).toContainText('51–60 of 60', { timeout: 8000 });
       await win.getByTestId('query-bar-input').fill('{"n":{"$gte":0}}');
       await expect(win.getByTestId('page-reset-hint')).toBeVisible();
       await expectQueryRowWhole(win, '960 page-reset hint');
@@ -179,7 +189,7 @@ test('right-hand controls and row buttons hold still when results change', async
       await win.waitForTimeout(300);
       const anchored = async () => {
         const { left } = await readBar(win, 'result-bar');
-        return [left.Fields, left['Insert document'], left.Documents];
+        return [left.Fields, left['Insert document'], left['More actions']];
       };
       const rowButton = () =>
         win.evaluate(() =>
@@ -206,16 +216,16 @@ test('below 1100 px one side panel shows, and focus cannot scroll the pane sidew
       await open(win);
       await win.setViewportSize({ width: 900, height: 600 });
 
-      const openBuilder = win.getByRole('button', { name: 'Open Query Builder', exact: true });
-      await expect(openBuilder).toBeVisible();
-      await expect(win.getByRole('button', { name: 'Collapse navigator', exact: true })).toBeVisible();
+      const openBuilder = win.getByRole('button', { name: 'Builder', exact: true });
+      await expect(openBuilder).toHaveAttribute('aria-pressed', 'false');
+      await expect(win.getByRole('button', { name: 'Toggle sidebar', exact: true })).toHaveAttribute('aria-pressed', 'true');
 
       await openBuilder.click();
-      await expect(win.getByRole('button', { name: 'Open navigator', exact: true })).toBeVisible();
-      await expect(win.getByRole('tablist', { name: 'Query drawer' })).toBeVisible();
+      await expect(win.getByRole('button', { name: 'Toggle sidebar', exact: true })).toHaveAttribute('aria-pressed', 'false');
+      await expect(win.getByRole('tablist', { name: 'Inspector view' })).toBeVisible();
       await win.waitForTimeout(300);
-      const drawer = await win.getByRole('tablist', { name: 'Query drawer' }).boundingBox();
-      expect(drawer!.width).toBeGreaterThanOrEqual(270);
+      const drawer = await win.getByTestId('inspector').boundingBox();
+      expect(drawer!.width).toBeGreaterThanOrEqual(319);
 
       const scrolled = () =>
         win.evaluate(() => [...document.querySelectorAll('*')].filter((e) => e.scrollLeft > 0).map((e) => e.tagName));
@@ -223,14 +233,17 @@ test('below 1100 px one side panel shows, and focus cannot scroll the pane sidew
       await win.waitForTimeout(150);
       expect(await scrolled()).toEqual([]);
 
-      // The wide layout comes back untouched: both panels, the drawer at its stored share.
+      // The wide layout comes back untouched: the stored one, with the sidebar open and the
+      // Inspector closed (the narrow choice is forgotten). Opening it gives its default 400 px.
       await win.setViewportSize({ width: 1280, height: 800 });
-      await expect(win.getByRole('button', { name: 'Collapse navigator', exact: true })).toBeVisible();
-      await expect(win.getByRole('button', { name: 'Collapse Query Builder', exact: true })).toBeVisible();
+      await expect(win.getByRole('button', { name: 'Toggle sidebar', exact: true })).toHaveAttribute('aria-pressed', 'true');
+      await expect(win.getByRole('button', { name: 'Builder', exact: true })).toHaveAttribute('aria-pressed', 'false');
+      await openBuilder.click();
+      await expect(win.getByRole('button', { name: 'Builder', exact: true })).toHaveAttribute('aria-pressed', 'true');
       await win.waitForTimeout(300);
-      const wide = await win.getByRole('tablist', { name: 'Query drawer' }).boundingBox();
-      expect(wide!.width).toBeGreaterThan(260);
-      expect(wide!.width).toBeLessThan(290);
+      const wide = await win.getByTestId('inspector').boundingBox();
+      expect(wide!.width).toBeGreaterThan(380);
+      expect(wide!.width).toBeLessThan(420);
     });
   });
 });
@@ -241,6 +254,8 @@ test('filter status line holds its height, whatever the state', async () => {
     await win.waitForLoadState('domcontentloaded');
     await expectConsoleClean(win, async () => {
       await open(win);
+      // The builder is closed by default and lives in the Inspector (W05 §9.7).
+      await new WorkspacePage(win).openBuilder();
       const line = win.getByTestId('filter-status-line');
       const read = async () => {
         const box = await line.boundingBox();
@@ -265,9 +280,7 @@ test('aggregation bar never clips, and a stage preview does not push the page', 
     await expectConsoleClean(win, async () => {
       await open(win);
       await new WorkspacePage(win).tablist.getByRole('tab', { name: /Aggregation/ }).click();
-      await win.getByRole('button', { name: /Add stage/ }).first().click();
-      await win.getByRole('textbox', { name: 'Search stages' }).fill('match');
-      await win.getByText('$match', { exact: true }).first().click();
+      await win.getByRole('button', { name: '$match', exact: true }).click();
       const body = win.locator('[data-testid="stage-body-editor-1"] .cm-content');
       await body.click();
       await win.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A');
@@ -279,19 +292,97 @@ test('aggregation bar never clips, and a stage preview does not push the page', 
       await win.getByRole('button', { name: 'Run', exact: true }).click();
       await expect(win.getByText(/5 docs|60 docs/).first()).toBeVisible({ timeout: 8000 });
       await win.waitForTimeout(300);
-      expect((await stageRow.boundingBox())!.height).toBe(before!.height);
+      // The card grows by its `→ n documents` footer (A01 §9.3) and by nothing else.
+      const footer = (await stageRow.getByText(/→ \d+ documents/).boundingBox())!;
+      const after = (await stageRow.boundingBox())!;
+      expect(after.height - before!.height).toBeCloseTo(footer.height, 0);
+      expect(after.y).toBe(before!.y);
 
       for (const [width, height] of SIZES) {
         await win.setViewportSize({ width, height });
         await win.waitForTimeout(300);
+        const pipelineBar = await readBar(win, 'pipeline-bar');
+        expect(pipelineBar.overflow, `${width}: pipeline bar overflow`).toBeLessThanOrEqual(0);
+        expect(pipelineBar.clipped, `${width}: pipeline bar clipped`).toEqual([]);
         const bar = await readBar(win, 'output-bar');
         expect(bar.overflow, `${width}: bar overflow`).toBeLessThanOrEqual(0);
         expect(bar.clipped, `${width}: clipped`).toEqual([]);
         expect(bar.barHeight, `${width}: one row`).toBe(42);
-        // Below some width the editor stacks over its preview instead of shrinking.
+        // Side by side the stages column keeps its width; stacked, the editor has the full width.
         const editor = await win.getByTestId('stage-body-editor-1').boundingBox();
         expect(editor!.width, `${width}: stage editor width`).toBeGreaterThanOrEqual(300);
       }
     });
   });
 });
+
+// A total of 3 characters ("123") and one of 7 ("123,456"): the pager label's reserved
+// room follows the total, so the steps move with it.
+const TOTALS = [123, 123_456];
+
+for (const total of TOTALS) {
+  test(`results toolbar holds every control at pane widths down to 320 (total ${total.toLocaleString()})`, async () => {
+    const server = await startMemoryServer();
+    // Seeded straight into the server: 123,456 documents through the bridge would take minutes.
+    const client = await MongoClient.connect(`mongodb://${server.host}:${server.port}/?directConnection=true`);
+    try {
+      const docs = Array.from({ length: total }, (_, n) => ({ n }));
+      for (let i = 0; i < docs.length; i += 20_000) {
+        await client.db('narrow').collection('orders').insertMany(docs.slice(i, i + 20_000));
+      }
+    } finally {
+      await client.close();
+    }
+    await withApp(async (app) => {
+      const win = await app.firstWindow();
+      await win.waitForLoadState('domcontentloaded');
+      await expectConsoleClean(win, async () => {
+        await seedActiveConnectionWithDocs(
+          win,
+          { ...baseConnInput(server.host, server.port), name: 'Narrow' },
+          { dbName: 'narrow', collection: 'orders', docs: [] },
+        );
+        await expectStatusDot(win, 'Narrow', 'connected');
+        await new WorkspacePage(win).openCollectionFromNavigator('narrow', 'orders');
+        await win.setViewportSize({ width: 1440, height: 900 });
+        const bar = win.getByTestId('result-bar');
+        await expect(bar.getByTestId('page-label')).toContainText(`of ${total.toLocaleString()}`, { timeout: 15_000 });
+
+        // The pane is at least 320 wide; the bar is the pane's width, so it is set to each.
+        for (const width of [320, 470, 520, 560, 700]) {
+          await win.evaluate((w) => {
+            const el = document.querySelector<HTMLElement>('[data-testid="result-bar"]')!;
+            el.style.width = `${w}px`;
+            el.style.alignSelf = 'flex-start';
+          }, width);
+          await win.waitForTimeout(250);
+          const read = await win.evaluate(() => {
+            const el = document.querySelector<HTMLElement>('[data-testid="result-bar"]')!;
+            const box = el.getBoundingClientRect();
+            const inside = (r: DOMRect) => r.width > 0 && r.left >= box.left - 1 && r.right <= box.right + 1;
+            const controls: Record<string, boolean> = {};
+            for (const name of ['Insert document', 'Next page', 'More actions', 'Previous page']) {
+              controls[name] = inside(el.querySelector(`[aria-label="${name}"]`)!.getBoundingClientRect());
+            }
+            controls['page-label'] = inside(el.querySelector('[data-testid="page-label"]')!.getBoundingClientRect());
+            return { width: box.width, overflow: el.scrollWidth - el.clientWidth, controls };
+          });
+          const label = `${total} at ${width}`;
+          expect(read.width, `${label}: bar width`).toBe(width);
+          expect(read.overflow, `${label}: bar overflow`).toBeLessThanOrEqual(1);
+          expect(read.controls, `${label}: controls inside the bar`).toEqual({
+            'Insert document': true,
+            'Next page': true,
+            'More actions': true,
+            'Previous page': true,
+            'page-label': true,
+          });
+          for (const name of ['Insert document', 'Next page']) {
+            await expect(bar.getByLabel(name, { exact: true }), `${label}: ${name}`).toBeVisible();
+          }
+          await expect(bar.getByTestId('page-label'), `${label}: page label`).toBeVisible();
+        }
+      });
+    });
+  });
+}
