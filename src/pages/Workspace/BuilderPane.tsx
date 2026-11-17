@@ -728,9 +728,12 @@ function CondRow({
         background: rowDrop.isActive ? T.accentSoft : undefined,
         boxShadow: rowDrop.isActive ? `inset 0 0 0 1.5px ${T.accent}` : undefined,
         transition: 'background 120ms, box-shadow 120ms',
+        width: '100%',
+        minWidth: 0,
+        boxSizing: 'border-box',
       }}
     >
-      <div style={{ display: 'flex', gap: T.gapXs, alignItems: 'center' }}>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: T.gapXs, alignItems: 'center', minWidth: 0 }}>
         <IncludeBox
           node={node}
           label={node.field.trim() ? `Include condition ${node.field}` : 'Include condition'}
@@ -738,7 +741,7 @@ function CondRow({
           onToggle={toggle}
           describedBy={excludedNoteId}
         />
-        <div style={{ display: 'flex', gap: T.gapXs, alignItems: 'center', flex: 1, minWidth: 0, opacity: dim }}>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: T.gapXs, alignItems: 'center', flex: '1 1 180px', minWidth: 0, opacity: dim }}>
           <TextInput
             ref={fieldInputRef}
             placeholder="field"
@@ -872,7 +875,7 @@ function CondRow({
         </div>
       </div>
 
-      <div style={{ display: 'flex', gap: T.gapXs, alignItems: 'flex-start', opacity: dim }}>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: T.gapXs, alignItems: 'flex-start', width: '100%', minWidth: 0, boxSizing: 'border-box', opacity: dim }}>
         <Select
           value={node.valType}
           disabled={readOnly}
