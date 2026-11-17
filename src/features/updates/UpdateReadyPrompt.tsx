@@ -1,10 +1,12 @@
-import { useEffect } from 'react';
-import { api, getErrorMessage } from '../../api/atelier';
+import { useEffect, useRef } from 'react';
+import { api } from '../../api/atelier';
 import { logFailure } from '../../utils/rendererLog';
 import { notify } from '../../theme/notifications';
-import type { UpdateState } from '@shared/types';
+import { restartToUpdate } from './updateActions';
+import { useUpdatePillMounted, useUpdateState } from './updateStateContext';
 
 const TOAST_ID = 'update-ready';
+const TOAST_SHOWN_KEY = 'update.toastShownFor';
 
 function showReady(version: string): void {
   notify.info(`Version ${version} is ready`, {
@@ -13,30 +15,46 @@ function showReady(version: string): void {
     action: {
       label: 'Restart to update',
       onClick: () => {
-        api.updates.restart().catch((e: unknown) => {
-          notify.error(
-            `${getErrorMessage(e, 'The update could not be applied')}. It will be applied when you quit.`,
-          );
-        });
+        void restartToUpdate();
       },
     },
   });
 }
 
-/** Renders nothing: surfaces one non-modal toast once an update has downloaded. */
+/**
+ * Renders nothing: wherever no status-bar pill is on screen (the Connections
+ * screens, and the welcome canvas, which has no status bar), surfaces one
+ * non-modal toast per version once an update has downloaded (X22 §4).
+ */
 export function UpdateReadyPrompt() {
+  const state = useUpdateState();
+  const pillShown = useUpdatePillMounted();
+  const readyVersion = state.status === 'ready' ? state.version : null;
+  // The pref write is async: this stops a re-run in the same session from
+  // reading the old value and showing the toast a second time.
+  const handled = useRef<string | null>(null);
+
   useEffect(() => {
-    const onState = (s: UpdateState) => {
-      if (s.status === 'ready') showReady(s.version);
+    if (readyVersion === null || pillShown || handled.current === readyVersion) return;
+    let cancelled = false;
+    api.prefs
+      .get<unknown>(TOAST_SHOWN_KEY)
+      .then((stored) => {
+        if (cancelled) return;
+        handled.current = readyVersion;
+        if (stored === readyVersion) return;
+        showReady(readyVersion);
+        api.prefs
+          .set(TOAST_SHOWN_KEY, readyVersion)
+          .catch((err) => logFailure('saving the version the update toast was shown for', err));
+      })
+      // The toast is optional: an unreadable preference shows nothing, and the
+      // pill and Settings still say an update is ready.
+      .catch((err) => logFailure('reading the version the update toast was shown for', err));
+    return () => {
+      cancelled = true;
     };
-    // The push can fire before this mounts, so ask once, then listen.
-    api.updates
-      .getState()
-      .then(onState)
-      // The prompt is optional: a failed read leaves it unshown, and an update
-      // that is ready still installs on quit.
-      .catch((err) => logFailure('reading the update state', err));
-    return api.updates.onState(onState);
-  }, []);
+  }, [readyVersion, pillShown]);
+
   return null;
 }

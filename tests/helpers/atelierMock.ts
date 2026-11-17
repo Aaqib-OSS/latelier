@@ -43,6 +43,7 @@ export function installAtelierMock(overrides: Deep<IpcApi> = {}): IpcApi {
     app: {
       pickFile: async () => ({ path: null }),
       openExternal: async () => ({ opened: false }),
+      getInfo: async () => ({ version: '0.0.0-test', platform: 'darwin', arch: 'arm64' }),
       saveFile: async () => ({ path: null }),
       diagnosticBundle: async () => ({ path: null }),
       setUnsavedWork: async () => {},
@@ -53,6 +54,7 @@ export function installAtelierMock(overrides: Deep<IpcApi> = {}): IpcApi {
     },
     updates: {
       getState: async () => ({ status: 'idle' as const }),
+      check: async () => ({ status: 'idle' as const }),
       restart: async (): Promise<{ restarting: boolean }> => ({ restarting: true }),
       onState: () => () => {},
     },
@@ -393,6 +395,7 @@ function makePermissiveStub(): IpcApi {
     app: {
       pickFile: async () => ({ path: null }),
       openExternal: async () => ({ opened: false }),
+      getInfo: async () => ({ version: '0.0.0-test', platform: 'darwin', arch: 'arm64' }),
       saveFile: async () => ({ path: null }),
       diagnosticBundle: async () => ({ path: null }),
       setUnsavedWork: async () => {},
@@ -403,6 +406,7 @@ function makePermissiveStub(): IpcApi {
     },
     updates: {
       getState: async () => ({ status: 'idle' as const }),
+      check: async () => ({ status: 'idle' as const }),
       restart: async (): Promise<{ restarting: boolean }> => ({ restarting: true }),
       onState: () => () => {},
     },

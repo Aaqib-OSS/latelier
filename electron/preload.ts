@@ -71,6 +71,7 @@ const api: IpcApi = {
   app: {
     pickFile: (purpose) => call(IPC_CHANNELS.appPickFile, purpose),
     openExternal: (url) => call(IPC_CHANNELS.appOpenExternal, url),
+    getInfo: () => call(IPC_CHANNELS.appGetInfo, {}),
     saveFile: (input) => call(IPC_CHANNELS.appSaveFile, input),
     diagnosticBundle: () => call(IPC_CHANNELS.appDiagnosticBundle, {}),
     setUnsavedWork: (input) => call(IPC_CHANNELS.appSetUnsavedWork, input),
@@ -90,6 +91,7 @@ const api: IpcApi = {
 
   updates: {
     getState: () => call(IPC_CHANNELS.updatesGetState, {}),
+    check: () => call(IPC_CHANNELS.updatesCheck, {}),
     restart: () => call(IPC_CHANNELS.updatesRestart, {}),
     onState: (cb) => {
       const listener = (_evt: unknown, state: unknown) => cb(state as Parameters<typeof cb>[0]);

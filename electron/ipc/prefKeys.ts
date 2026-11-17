@@ -41,6 +41,10 @@ const SET_SCHEMAS = new Map<string, z.ZodType>([
   ['ui.workspace.documentEditorSize', z.object({ width: finite, height: finite.optional() })],
   ['ui.commandPalette.mru', z.array(z.string().max(512)).max(16)],
   ['ui.connections.pinned', z.array(z.string().uuid()).max(500)],
+  // The version whose release notes the What's new window last showed (X22 §6.2).
+  ['whatsNew.lastSeenVersion', z.string().max(32)],
+  // The version the away-from-workspace update toast last showed for (X22 §4): once per version.
+  ['update.toastShownFor', z.string().max(32)],
 ]);
 
 // Connection ids are `crypto.randomUUID()`. One bounded character class and an

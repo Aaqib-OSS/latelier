@@ -259,6 +259,8 @@ export interface IpcApi {
   app: {
     pickFile: (purpose: PickFilePurpose) => Promise<{ path: string | null }>;
     openExternal: (url: string) => Promise<{ opened: boolean }>;
+    /** The running app's version, OS (`process.platform`) and CPU architecture (`process.arch`). */
+    getInfo: () => Promise<{ version: string; platform: string; arch: string }>;
     saveFile: (input: { defaultName?: string; content: string }) => Promise<{ path: string | null }>;
     /**
      * Build a JSON diagnostic bundle (recent logs + redacted connection
@@ -292,16 +294,22 @@ export interface IpcApi {
     log: (input: RendererLogInput) => Promise<void>;
   };
 
-  /** Auto-update: one state, one action. See specs/X20-auto-update.md. */
+  /** Auto-update: one state, two actions. See specs/X20-auto-update.md and X22. */
   updates: {
     getState: () => Promise<UpdateState>;
+    /**
+     * Looks for an update now and answers with the state once the check
+     * settles. While a check or download runs, or while `ready` or `off`, it
+     * answers the current state without starting anything and never throws.
+     */
+    check: () => Promise<UpdateState>;
     /**
      * Quits, installs the downloaded update and relaunches. Rejects unless
      * `ready`. Asks first when work is running; `restarting: false` means the
      * user cancelled, and main re-sends `ready` so Restart is offered again.
      */
     restart: () => Promise<{ restarting: boolean }>;
-    /** Main pushes the state when a download finishes; returns the unsubscribe. */
+    /** Main pushes every state change; returns the unsubscribe. */
     onState: (cb: (state: UpdateState) => void) => () => void;
   };
 
@@ -604,6 +612,7 @@ export const IPC_CHANNELS = {
   appMenuCommandEvent: 'app:menu-command-event',
   appPickFile:     'app:pickFile',
   appOpenExternal: 'app:openExternal',
+  appGetInfo: 'app:getInfo',
   appSaveFile:     'app:saveFile',
   appDiagnosticBundle: 'app:diagnosticBundle',
   appSetUnsavedWork: 'app:setUnsavedWork',
@@ -613,6 +622,7 @@ export const IPC_CHANNELS = {
 
   // Auto-update -----------------------------------------
   updatesGetState:   'updates:getState',
+  updatesCheck:      'updates:check',
   updatesRestart:    'updates:restart',
   updatesStateEvent: 'updates:state-event',
 
@@ -800,8 +810,10 @@ type EmptyObject = Record<string, never>;
 interface AdaptedSig {
   'conn:importOpen':         { in: EmptyObject; out: ApiOut<'conn', 'importOpen'> };
   'app:diagnosticBundle':    { in: EmptyObject; out: ApiOut<'app', 'diagnosticBundle'> };
+  'app:getInfo':             { in: EmptyObject; out: ApiOut<'app', 'getInfo'> };
   'app:flushDone':           { in: EmptyObject; out: ApiOut<'app', 'flushDone'> };
   'updates:getState':        { in: EmptyObject; out: ApiOut<'updates', 'getState'> };
+  'updates:check':           { in: EmptyObject; out: ApiOut<'updates', 'check'> };
   'updates:restart':         { in: EmptyObject; out: ApiOut<'updates', 'restart'> };
   'recent:clearFieldValues': { in: EmptyObject; out: ApiOut<'recent', 'clearFieldValues'> };
   'conn:get':        { in: { id: ApiArg<'conn', 'get'> }; out: ApiOut<'conn', 'get'> };
