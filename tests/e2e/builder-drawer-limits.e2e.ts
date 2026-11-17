@@ -188,7 +188,7 @@ test('every control in a condition row stays inside the drawer at 1280, with no 
   });
 });
 
-test('condition rows wrap at the minimum Inspector width, including nested objectid rows', async () => {
+test('nested objectid condition controls stay inside the Inspector at its minimum width', async () => {
   await withApp(async (app) => {
     const win = await app.firstWindow();
     await win.waitForLoadState('domcontentloaded');
