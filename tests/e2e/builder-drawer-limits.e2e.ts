@@ -26,6 +26,21 @@ async function open(win: Page) {
 const drawerWidth = (win: Page) =>
   win.getByRole('tablist', { name: 'Inspector view' }).evaluate((el) => el.closest('[data-panel]')!.getBoundingClientRect().width);
 
+/** Reports controls outside the Inspector and descendants that create horizontal scrolling. */
+async function conditionOverflow(win: Page) {
+  return win.evaluate(() => {
+    const drawer = document.querySelector('[aria-label="Inspector view"]')!.closest('[data-panel]')!;
+    const right = drawer.getBoundingClientRect().right;
+    const stray = [...drawer.querySelectorAll<HTMLElement>('[data-row-path] button, [data-row-path] input')]
+      .filter((el) => el.getBoundingClientRect().right > right + 0.5)
+      .map((el) => el.getAttribute('aria-label') ?? el.getAttribute('placeholder') ?? el.tagName);
+    const scrolling = [...drawer.querySelectorAll<HTMLElement>('*')]
+      .filter((el) => el.scrollWidth > el.clientWidth + 1 && getComputedStyle(el).overflowX !== 'visible')
+      .map((el) => el.tagName);
+    return { stray, scrolling };
+  });
+}
+
 test('the Inspector cannot be dragged narrower than 320 px', async () => {
   await withApp(async (app) => {
     const win = await app.firstWindow();
@@ -157,31 +172,70 @@ test('every control in a condition row stays inside the drawer at 1280, with no 
     await win.setViewportSize({ width: 1280, height: 800 });
     await open(win);
 
-    const overflow = () =>
-      win.evaluate(() => {
-        const drawer = document.querySelector('[aria-label="Inspector view"]')!.closest('[data-panel]')!;
-        const right = drawer.getBoundingClientRect().right;
-        const stray = [...drawer.querySelectorAll<HTMLElement>('[data-row-path] button, [data-row-path] input')]
-          .filter((el) => el.getBoundingClientRect().right > right + 0.5)
-          .map((el) => el.getAttribute('aria-label') ?? el.getAttribute('placeholder') ?? el.tagName);
-        const scrolling = [...drawer.querySelectorAll<HTMLElement>('*')]
-          .filter((el) => el.scrollWidth > el.clientWidth + 1 && getComputedStyle(el).overflowX !== 'visible')
-          .map((el) => el.tagName);
-        return { stray, scrolling };
-      });
-
     await win.getByRole('button', { name: 'Add condition', exact: true }).click();
     await expect(win.getByRole('button', { name: 'Remove condition' })).toBeVisible();
-    expect(await overflow()).toEqual({ stray: [], scrolling: [] });
+    expect(await conditionOverflow(win)).toEqual({ stray: [], scrolling: [] });
 
     // The longest value type has to fit its select too, not only the default one.
     await win.locator('input[aria-label="Value type"]').click();
     await win.getByRole('option', { name: 'objectid', exact: true }).click();
-    expect(await overflow()).toEqual({ stray: [], scrolling: [] });
+    expect(await conditionOverflow(win)).toEqual({ stray: [], scrolling: [] });
 
     await win.getByRole('button', { name: 'More ways to add', exact: true }).click();
     await win.getByRole('menuitem', { name: 'Add group', exact: true }).click();
     await win.getByRole('button', { name: 'Add condition to group 2', exact: true }).click();
-    expect(await overflow()).toEqual({ stray: [], scrolling: [] });
+    expect(await conditionOverflow(win)).toEqual({ stray: [], scrolling: [] });
+  });
+});
+
+test('condition rows wrap at the minimum Inspector width, including nested objectid rows', async () => {
+  await withApp(async (app) => {
+    const win = await app.firstWindow();
+    await win.waitForLoadState('domcontentloaded');
+    await win.setViewportSize({ width: 1600, height: 900 });
+    await open(win);
+
+    await win.getByRole('button', { name: 'Add condition', exact: true }).click();
+    await win.getByRole('button', { name: 'More ways to add', exact: true }).click();
+    await win.getByRole('menuitem', { name: 'Add group', exact: true }).click();
+    await win.getByRole('button', { name: 'Add condition to group 2', exact: true }).click();
+    await win.locator('input[aria-label="Value type"]').last().click();
+    await win.getByRole('option', { name: 'objectid', exact: true }).click();
+
+    const handle = win.getByRole('separator', { name: 'Resize inspector' });
+    const box = await handle.boundingBox();
+    expect(box, 'the divider has a layout box').not.toBeNull();
+    const y = box!.y + 100;
+    await win.mouse.move(box!.x + 2, y);
+    await win.mouse.down();
+    await win.mouse.move(1598, y, { steps: 20 });
+    await win.mouse.up();
+    await win.waitForTimeout(300);
+
+    const layout = await win.evaluate(() => {
+      const inspector = document.querySelector('[aria-label="Inspector view"]')!.closest('[data-panel]')!;
+      const rows = [...inspector.querySelectorAll<HTMLElement>('[data-row-path]')];
+      const nested = rows[rows.length - 1];
+      const valueBand = nested?.children[1] as HTMLElement | undefined;
+      const typeSelect = valueBand?.querySelector<HTMLInputElement>('input[aria-label="Value type"]');
+      const valueInput = valueBand?.querySelector<HTMLInputElement>('input[placeholder="value"]');
+      const typeTop = typeSelect?.getBoundingClientRect().top ?? 0;
+      const valueTop = valueInput?.getBoundingClientRect().top ?? 0;
+      return {
+        inspectorWidth: inspector.getBoundingClientRect().width,
+        rowCount: rows.length,
+        objectIdTypeSelected: typeSelect?.value === 'objectid',
+        nestedValueControlsWrap: !!typeSelect && !!valueInput && Math.abs(typeTop - valueTop) > 1,
+        nestedRowWidth: nested?.getBoundingClientRect().width ?? 0,
+      };
+    });
+
+    expect(layout.inspectorWidth).toBeGreaterThanOrEqual(320 - 1);
+    expect(layout.inspectorWidth).toBeLessThanOrEqual(320 + 2);
+    expect(layout.rowCount).toBeGreaterThanOrEqual(2);
+    expect(layout.objectIdTypeSelected).toBe(true);
+    expect(layout.nestedRowWidth).toBeGreaterThan(0);
+    expect(layout.nestedValueControlsWrap).toBe(true);
+    expect(await conditionOverflow(win)).toEqual({ stray: [], scrolling: [] });
   });
 });
