@@ -35,7 +35,6 @@ test('restores the same Focused Tab, runs it and focuses its filter, across a qu
         const api = (window as unknown as {
           atelier: {
             conn: { create: (i: unknown) => Promise<{ id: string }> };
-            mongo: { connect: (id: string) => Promise<{ status: string; errorMessage?: string }> };
             tabs: {
               openCollection: (i: {
                 connectionId: string;
@@ -47,10 +46,6 @@ test('restores the same Focused Tab, runs it and focuses its filter, across a qu
           };
         }).atelier;
         const c = await api.conn.create(input);
-        const runtime = await api.mongo.connect(c.id);
-        if (runtime.status !== 'connected') {
-          throw new Error(`MongoDB connection failed: ${runtime.errorMessage ?? runtime.status}`);
-        }
         await api.tabs.openCollection({ connectionId: c.id, dbName: 'db', collection: 'alpha' });
         const beta = await api.tabs.openCollection({
           connectionId: c.id,
