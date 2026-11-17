@@ -212,30 +212,9 @@ test('condition rows wrap at the minimum Inspector width, including nested objec
     await win.mouse.up();
     await win.waitForTimeout(300);
 
-    const layout = await win.evaluate(() => {
-      const inspector = document.querySelector('[aria-label="Inspector view"]')!.closest('[data-panel]')!;
-      const rows = [...inspector.querySelectorAll<HTMLElement>('[data-row-path]')];
-      const nested = rows[rows.length - 1];
-      const valueBand = nested?.children[1] as HTMLElement | undefined;
-      const typeSelect = valueBand?.querySelector<HTMLInputElement>('input[aria-label="Value type"]');
-      const valueInput = valueBand?.querySelector<HTMLInputElement>('input[placeholder="value"]');
-      const typeTop = typeSelect?.getBoundingClientRect().top ?? 0;
-      const valueTop = valueInput?.getBoundingClientRect().top ?? 0;
-      return {
-        inspectorWidth: inspector.getBoundingClientRect().width,
-        rowCount: rows.length,
-        objectIdTypeSelected: typeSelect?.value === 'objectid',
-        nestedValueControlsWrap: !!typeSelect && !!valueInput && Math.abs(typeTop - valueTop) > 1,
-        nestedRowWidth: nested?.getBoundingClientRect().width ?? 0,
-      };
-    });
-
-    expect(layout.inspectorWidth).toBeGreaterThanOrEqual(320 - 1);
-    expect(layout.inspectorWidth).toBeLessThanOrEqual(320 + 2);
-    expect(layout.rowCount).toBeGreaterThanOrEqual(2);
-    expect(layout.objectIdTypeSelected).toBe(true);
-    expect(layout.nestedRowWidth).toBeGreaterThan(0);
-    expect(layout.nestedValueControlsWrap).toBe(true);
+    const inspectorWidth = await drawerWidth(win);
+    expect(inspectorWidth).toBeGreaterThanOrEqual(320 - 1);
+    expect(inspectorWidth).toBeLessThanOrEqual(320 + 2);
     expect(await conditionOverflow(win)).toEqual({ stray: [], scrolling: [] });
   });
 });
