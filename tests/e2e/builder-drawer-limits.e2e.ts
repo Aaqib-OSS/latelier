@@ -173,12 +173,12 @@ test('every control in a condition row stays inside the drawer at 1280, with no 
     await open(win);
 
     await win.getByRole('button', { name: 'Add condition', exact: true }).click();
-    await expect(win.getByRole('button', { name: 'Remove condition' })).toBeVisible();
+    await expect(win.getByRole('button', { name: 'Condition options 1', exact: true })).toBeVisible();
     expect(await conditionOverflow(win)).toEqual({ stray: [], scrolling: [] });
 
     // The longest value type has to fit its select too, not only the default one.
-    await win.locator('input[aria-label="Value type"]').click();
-    await win.getByRole('option', { name: 'objectid', exact: true }).click();
+    await win.getByRole('button', { name: /^Value type: / }).click();
+    await win.getByRole('menuitem', { name: 'objectid', exact: true }).click();
     expect(await conditionOverflow(win)).toEqual({ stray: [], scrolling: [] });
 
     await win.getByRole('button', { name: 'More ways to add', exact: true }).click();
@@ -199,8 +199,8 @@ test('nested objectid condition controls stay inside the Inspector at its minimu
     await win.getByRole('button', { name: 'More ways to add', exact: true }).click();
     await win.getByRole('menuitem', { name: 'Add group', exact: true }).click();
     await win.getByRole('button', { name: 'Add condition to group 2', exact: true }).click();
-    await win.locator('input[aria-label="Value type"]').last().click();
-    await win.getByRole('option', { name: 'objectid', exact: true }).click();
+    await win.getByRole('button', { name: /^Value type: / }).last().click();
+    await win.getByRole('menuitem', { name: 'objectid', exact: true }).click();
 
     const handle = win.getByRole('separator', { name: 'Resize inspector' });
     const box = await handle.boundingBox();
@@ -216,5 +216,40 @@ test('nested objectid condition controls stay inside the Inspector at its minimu
     expect(inspectorWidth).toBeGreaterThanOrEqual(320 - 1);
     expect(inspectorWidth).toBeLessThanOrEqual(320 + 2);
     expect(await conditionOverflow(win)).toEqual({ stray: [], scrolling: [] });
+  });
+});
+
+test('the operator suggestion list stays inside the window at every drawer width', async () => {
+  await withApp(async (app) => {
+    const win = await app.firstWindow();
+    await win.waitForLoadState('domcontentloaded');
+    await win.setViewportSize({ width: 1440, height: 900 });
+    await open(win);
+    await win.getByRole('button', { name: 'Add condition', exact: true }).click();
+
+    const handle = win.getByRole('separator', { name: 'Resize inspector' });
+    const op = win.getByPlaceholder('$op', { exact: true });
+    for (const target of [320, 400, 640]) {
+      const box = await handle.boundingBox();
+      expect(box, 'the divider has a layout box').not.toBeNull();
+      const y = box!.y + 100;
+      await win.mouse.move(box!.x + 2, y);
+      await win.mouse.down();
+      await win.mouse.move(1440 - target, y, { steps: 15 });
+      await win.mouse.up();
+      await win.waitForTimeout(300);
+      expect(Math.abs((await drawerWidth(win)) - target)).toBeLessThanOrEqual(6);
+
+      await op.click();
+      const list = win.getByRole('listbox', { name: 'Operator suggestions' });
+      await expect(list).toBeVisible();
+      // The positioning box around the list (and its footer) is what the
+      // window edge has to hold, not just the rows inside it.
+      await win.waitForTimeout(150);
+      const right = await list.evaluate((el) => el.parentElement!.getBoundingClientRect().right);
+      expect(right, `list right edge at a ${target}px drawer`).toBeLessThanOrEqual(1440);
+      await win.keyboard.press('Escape');
+      await expect(list).toBeHidden();
+    }
   });
 });
