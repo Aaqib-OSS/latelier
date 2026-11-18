@@ -5,7 +5,6 @@ import {
   Checkbox,
   Menu,
   VisuallyHidden,
-  Select,
   TextInput,
   Tooltip,
 } from '@mantine/core';
@@ -16,7 +15,6 @@ import { I } from '../../icons';
 import { notify } from '../../theme/notifications';
 import {
   emptyBuilder,
-  FIELD_OPS,
   DRAGGED_FIELD_MIME,
   condFromDragged,
   mergeOrReplaceDragged,
@@ -52,8 +50,7 @@ import { peekFilterRequest, subscribeTabRequests, takeFilterRequest } from './ta
 import { useSuggestions } from '../../features/fieldSuggestions/useSuggestions';
 import { SuggestionPopover } from '../../features/fieldSuggestions/SuggestionPopover';
 import { DEFAULT_FIELD_SOURCES, fieldOperatorSource } from '../../features/fieldSuggestions/sources';
-import { hasOperatorDocs, resolveOperatorSymbol } from '../../features/fieldSuggestions/operators';
-import { OperatorTooltip } from '../../features/fieldSuggestions/OperatorTooltip';
+import { operatorDisplay, resolveOperatorSymbol } from '../../features/fieldSuggestions/operators';
 import type { SuggestionContext } from '../../features/fieldSuggestions/types';
 import type {
   BuilderState,
@@ -67,7 +64,9 @@ import { liveValidity } from '../../utils/shellSyntax';
 import { useLiveMatchCount } from './useLiveMatchCount';
 import { CondValueEditor } from './CondValueEditor';
 import { useStructureEntries } from './useStructureEntries';
-import { condTypeWarning } from './condValue';
+import { VAL_TYPES, condTypeWarning, condValueKind, valTypePatch } from './condValue';
+import { checkFieldType } from './schemaSummary';
+import type { DisplayType } from '../../utils/displayValue';
 import { FILTER_TEMPLATES, type FilterTemplate } from './filterTemplates';
 import { builderToStages } from './builderToPipeline';
 import { CODE_LANGS, type CodeLang } from '../../utils/driverCode';
@@ -86,7 +85,6 @@ interface BuilderPaneProps {
   onLoaded: () => void;
 }
 
-const VAL_TYPES: ValType[] = ['string', 'number', 'long', 'decimal', 'boolean', 'date', 'null', 'regex', 'objectid', 'array'];
 
 const EMPTY_ROOT: GroupNode = { kind: 'group', logic: '$and', children: [] };
 
@@ -238,12 +236,14 @@ function LogicPicker({
  * down / Convert to raw clause (cond rows only) / Wrap in group / Negate (NOT)
  * / Duplicate.
  *
- * Remove has its own one-click ✕ beside this menu rather than living here
- * too — one affordance per action, not two. Move up/down live here instead
- * of as two more icons on every row: a `Menu.Item` is keyboard-reachable, so
- * reorder is never drag-only, and the row's control strip stays a fixed
- * width. At the ends the item is disabled rather than hidden, so the menu
- * doesn't change shape row to row.
+ * A condition's Remove is the last item: it has no delete button of its own, so
+ * the strip beside the operator stays one icon wide (a raw clause keeps its ✕). Move up/down live here
+ * instead of as two more icons on every row: a `Menu.Item` is
+ * keyboard-reachable, so reorder is never drag-only. At the ends the item is
+ * disabled rather than hidden, so the menu doesn't change shape row to row.
+ *
+ * A condition whose value area has no type chip (a switch, or null) offers
+ * its value type here, so no type is a dead end.
  */
 function RowMenu({
   onConvertToRaw,
@@ -251,6 +251,8 @@ function RowMenu({
   onNegate,
   onInsert,
   onDuplicate,
+  onRemove,
+  valueType,
   onMove,
   canMoveUp,
   canMoveDown,
@@ -264,6 +266,10 @@ function RowMenu({
   /** Adds a blank condition beside this row: `0` above it, `1` below. */
   onInsert: (offset: 0 | 1) => void;
   onDuplicate: () => void;
+  /** Takes the row out of the filter; one undo step brings it back. */
+  onRemove?: () => void;
+  /** The row's value type and how to change it, for a row with no type chip. */
+  valueType?: { current: ValType; onChange: (vt: ValType) => void };
   onMove: (delta: number) => void;
   canMoveUp: boolean;
   canMoveDown: boolean;
@@ -299,6 +305,30 @@ function RowMenu({
         <Menu.Item onClick={onWrap}>Wrap in group</Menu.Item>
         <Menu.Item onClick={onNegate}>Negate (NOT)</Menu.Item>
         <Menu.Item onClick={onDuplicate}>Duplicate</Menu.Item>
+        {valueType && (
+          <Menu.Sub>
+            <Menu.Sub.Target>
+              <Menu.Sub.Item>Value type</Menu.Sub.Item>
+            </Menu.Sub.Target>
+            <Menu.Sub.Dropdown>
+              {VAL_TYPES.map((vt) => (
+                <Menu.Item
+                  key={vt}
+                  aria-current={vt === valueType.current ? 'true' : undefined}
+                  fw={vt === valueType.current ? 700 : undefined}
+                  onClick={() => valueType.onChange(vt)}
+                >
+                  {vt}
+                </Menu.Item>
+              ))}
+            </Menu.Sub.Dropdown>
+          </Menu.Sub>
+        )}
+        {onRemove && (
+          <Menu.Item color="red" onClick={onRemove}>
+            Remove
+          </Menu.Item>
+        )}
       </Menu.Dropdown>
     </Menu>
   );
@@ -544,6 +574,36 @@ function useRowDropHandlers(
   };
 }
 
+/**
+ * Whether the panel is wide enough (560px) for a condition's value box to sit
+ * on the row's first line. Measured once for the whole tree, on the Inspector
+ * (the panel, which resizes between 320 and 640; the window says nothing),
+ * or on the root group when the builder renders outside an Inspector.
+ */
+const WIDE_PANEL_PX = 560;
+const WideContext = React.createContext(false);
+
+function WideProvider({ children }: { children: React.ReactNode }) {
+  const sentinel = React.useRef<HTMLSpanElement>(null);
+  const [wide, setWide] = React.useState(false);
+  React.useLayoutEffect(() => {
+    const el = sentinel.current;
+    const panel = el?.closest('[data-testid="inspector"]') ?? el?.nextElementSibling ?? null;
+    if (!panel || typeof ResizeObserver === 'undefined') return undefined;
+    const measure = () => setWide(panel.getBoundingClientRect().width >= WIDE_PANEL_PX);
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(panel);
+    return () => observer.disconnect();
+  }, []);
+  return (
+    <>
+      <span ref={sentinel} hidden />
+      <WideContext.Provider value={wide}>{children}</WideContext.Provider>
+    </>
+  );
+}
+
 function CondRow({
   node,
   path,
@@ -584,10 +644,13 @@ function CondRow({
   // `null` means "no draft" (nothing typed since the last commit); the box
   // then shows the committed `node.op`.
   const [opDraft, setOpDraft] = React.useState<string | null>(null);
-  const opValue = opDraft ?? node.op;
+  const opValue = opDraft ?? operatorDisplay(node.op);
+  // The suggestion list ranks on the operator's name, not its symbol: a bare
+  // symbol ranks nothing, and focusing a `>=` box should still open the list.
+  const opToken = opDraft ?? node.op;
   const { items: opSuggestionItems } = useSuggestions(
     opPopoverOpen ? opSuggestionCtx : null,
-    opValue,
+    opToken,
     { fieldSources: [fieldOperatorSource] },
   );
 
@@ -607,7 +670,7 @@ function CondRow({
   // `>` before the user reaches the `=`. Blur is also X14's commit point for
   // Shell Syntax, so the builder and the Filter Bar settle at the same moment.
   //
-  // The box keeps showing `$gt` afterwards. `node.op` therefore always holds a
+  // The box shows the symbol afterwards (`operatorDisplay`). `node.op` still holds a
   // real operator and `printFilter` / `isCompilableOp` are untouched.
   //
   // The popover guard below is defence rather than a live fix: the ranker
@@ -675,6 +738,47 @@ function CondRow({
     if (e.key !== 'Enter' || e.metaKey || e.ctrlKey || e.defaultPrevented) return;
     commitOpDraft();
   };
+  // A blank, non-null row takes the type of the field it names, and the op
+  // follows if the old one no longer fits. A row with a value already chose
+  // its type (a starter, or typing), and a null row must stay null, or
+  // `$ne: null` turns into `$ne: ""`, which matches null and missing fields.
+  const adoptedType = (type: DisplayType | undefined): Partial<CondNode> => {
+    if (node.valType === 'null' || node.value.trim() !== '') return {};
+    const valType = valTypeFromDisplayType(type);
+    return { valType, op: opForValType(valType, node.op) };
+  };
+  // Every way out of the field box (Tab, Escape, a click away, a pick) ends
+  // with the row typed like the sample says its field is. A pick does it
+  // itself and flags this blur as already handled.
+  const fieldPickedRef = React.useRef(false);
+  // The field text when the box took focus: tabbing through without editing it
+  // must keep a type the person chose by hand on a blank row.
+  const fieldOnFocusRef = React.useRef<string | null>(null);
+  const settleFieldType = () => {
+    if (fieldPickedRef.current) {
+      fieldPickedRef.current = false;
+      return;
+    }
+    if (fieldOnFocusRef.current === node.field) return;
+    const field = node.field.trim();
+    const dominant = field === '' ? null : checkFieldType(structureEntries, field, '');
+    if (!dominant) return;
+    const adopted = adoptedType(dominant.expectedType as DisplayType);
+    if (adopted.valType === undefined) return;
+    if (adopted.valType === node.valType && adopted.op === node.op) return;
+    patch(adopted);
+  };
+  // Escape stays with the box: it closes the list when one is showing (the
+  // popover has already claimed that key) and otherwise leaves the box. Either
+  // way the Inspector around the builder must not see it, since it closes on
+  // an Escape nobody took.
+  const handleFieldKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key !== 'Escape') return;
+    const listWasClosed = !e.defaultPrevented;
+    e.preventDefault();
+    e.stopPropagation();
+    if (listWasClosed) fieldInputRef.current?.blur();
+  };
   const remove = () => applyEdit(removeAt(root, path));
   const wrap = () => applyEdit(wrapInGroup(root, path, '$and'));
   // NOT over any subtree is a one-child `$nor`: no new node kind, and it
@@ -687,7 +791,7 @@ function CondRow({
   // back to a blank pending raw node whenever the op is uncompilable (below),
   // regardless of which uncompilable text it was given, so a still-drafted
   // `$elemMatch` converts the same as a committed one would.
-  const convertToRaw = () => applyEdit(updateAt(root, path, toRawNode({ ...node, op: opValue })));
+  const convertToRaw = () => applyEdit(updateAt(root, path, toRawNode({ ...node, op: opToken })));
   const toggle = () => applyEdit(updateAt(root, path, sameRow(node, toggleDisabled(node))));
   const dim = dimFor(node);
 
@@ -695,26 +799,35 @@ function CondRow({
   // offer a one-click escape to a raw clause the instant the op looks
   // unencodable, independent of whether the row currently has a print
   // problem (a pending row with an empty field never has one — §5.4). Keyed
-  // on the draft (`opValue`), not the committed `node.op` — the whole point
+  // on the draft (`opToken`), not the committed `node.op` — the whole point
   // is not waiting for a commit that would otherwise never come for text
   // like `$elemMatch`.
-  const showConvertToRaw = opValue.startsWith('$') && !isCompilableOp(opValue);
+  const showConvertToRaw = opToken.startsWith('$') && !isCompilableOp(opToken);
   // With a usable operator, a print problem can only be about the value, so
   // it shows under the value input as that input's description; an operator
   // problem stays on the row.
   const valueProblem = isCompilableOp(node.op) ? problem : undefined;
   const opProblem = valueProblem === undefined ? problem : undefined;
-  const showOpDocs = node.op.startsWith('$') && !problem && hasOperatorDocs(node.op, 'query');
 
-  // The row's one Remove control names what it removes. A row whose field is
-  // still blank has nothing to name, so it keeps the bare label rather than
-  // reading `Remove condition ""`.
-  const removeLabel = node.field.trim()
-    ? `Remove condition ${node.field}`
-    : 'Remove condition';
+  const wide = React.useContext(WideContext);
+  const kind = condValueKind(node);
+  // Operator column: a fixed width per displayed operator text (`>=` is 2
+  // chars, `$regex` 6), from the committed operator rather than the draft, so typing in the box never moves the row.
+  const opWidth = operatorDisplay(node.op).length > 5 ? 92 : 56;
+  const valueOnFirstLine = kind === 'box' && wide;
+  const hasSwitch = kind === 'exists' || kind === 'boolean';
+  const columns = [
+    '16px',
+    `minmax(${hasSwitch ? 64 : 96}px, ${valueOnFirstLine ? '2fr' : '1fr'})`,
+    `${opWidth}px`,
+    ...(valueOnFirstLine ? ['minmax(0, 3fr)'] : hasSwitch ? ['var(--sw-w)'] : []),
+    '24px',
+  ].join(' ');
+  const firstLine: React.CSSProperties = { gridRow: 1, opacity: dim, minWidth: 0 };
 
   return (
     <div
+      className="cond-row"
       onDragOver={rowDrop.onDragOver}
       onDrop={rowDrop.onDrop}
       data-row-path={pathKey(path)}
@@ -730,7 +843,11 @@ function CondRow({
         transition: 'background 120ms, box-shadow 120ms',
       }}
     >
-      <div style={{ display: 'flex', gap: T.gapXs, alignItems: 'center' }}>
+      <div
+        className={hasSwitch ? 'cond-switch-grid' : undefined}
+        style={{ display: 'grid', gridTemplateColumns: columns, columnGap: T.gapXs, alignItems: 'center' }}
+      >
+        <div style={{ gridRow: 1, gridColumn: 1, display: 'flex', alignItems: 'center' }}>
         <IncludeBox
           node={node}
           label={node.field.trim() ? `Include condition ${node.field}` : 'Include condition'}
@@ -738,7 +855,8 @@ function CondRow({
           onToggle={toggle}
           describedBy={excludedNoteId}
         />
-        <div style={{ display: 'flex', gap: T.gapXs, alignItems: 'center', flex: 1, minWidth: 0, opacity: dim }}>
+        </div>
+        <div style={{ ...firstLine, gridColumn: 2 }}>
           <TextInput
             ref={fieldInputRef}
             placeholder="field"
@@ -748,12 +866,17 @@ function CondRow({
               patchBox({ field: e.target.value }, 'field');
               if (!fieldPopoverOpen) setFieldPopoverOpen(true);
             }}
-            onFocus={() => setFieldPopoverOpen(true)}
+            onFocus={() => {
+              fieldOnFocusRef.current = node.field;
+              setFieldPopoverOpen(true);
+            }}
+            onKeyDown={handleFieldKeyDown}
             onBlur={() => {
+              settleFieldType();
               window.setTimeout(() => setFieldPopoverOpen(false), 100);
             }}
             size="xs"
-            style={{ flex: 1, minWidth: 96 }}
+            styles={{ input: { height: 30, minHeight: 30 } }}
           />
           <SuggestionPopover
             open={fieldPopoverOpen}
@@ -765,16 +888,18 @@ function CondRow({
                 // already chose its type (a starter, or typing): only a blank
                 // row takes the suggestion's type, or `$ne: null` turns into
                 // `$ne: ""`, which matches null and missing fields.
-                const adoptType = node.valType !== 'null' && node.value.trim() === '';
-                const nextValType = adoptType ? valTypeFromDisplayType(s.type) : node.valType;
-                const nextOp = opForValType(nextValType, node.op);
-                patch({ field: s.path, valType: nextValType, op: nextOp });
+                // The blur that follows runs against this render's stale row;
+                // the flag tells it the pick already settled the type.
+                fieldPickedRef.current = true;
+                patch({ field: s.path, ...adoptedType(s.type) });
               }
               setFieldPopoverOpen(false);
               fieldInputRef.current?.blur();
             }}
             onClose={() => setFieldPopoverOpen(false)}
           />
+        </div>
+        <div style={{ ...firstLine, gridColumn: 3 }}>
           <TextInput
             ref={opInputRef}
             placeholder="$op"
@@ -794,11 +919,7 @@ function CondRow({
             title={opProblem}
             error={!!opProblem}
             size="xs"
-            // Gives up width before the row overflows the drawer: the field
-            // box keeps its floor, and the remove button is the last control
-            // and the first to be cut off when the row is too wide.
-            style={{ flex: '0 1 76px', minWidth: 52 }}
-            styles={{ input: { fontFamily: 'monospace' } }}
+            styles={{ input: { fontFamily: 'monospace', height: 30, minHeight: 30, paddingInline: 6 } }}
           />
           <SuggestionPopover
             open={opPopoverOpen}
@@ -808,7 +929,7 @@ function CondRow({
             // Headers only over the unfiltered catalog. Focusing the box puts
             // the committed op in the token, which filters the list, so the
             // grouped view shows on a blank row or once the box is cleared.
-            groupOperators={opValue.trim() === ''}
+            groupOperators={opToken.trim() === ''}
             onSelect={(s) => {
               if (s.kind === 'operator') {
                 // The popover blurs the input on its way out, so the blur
@@ -829,21 +950,19 @@ function CondRow({
             }}
             onClose={() => setOpPopoverOpen(false)}
           />
-          {showOpDocs && (
-            <OperatorTooltip name={node.op} prefClass="query" placement="below">
-              <ActionIcon
-                type="button"
-                variant="default"
-                radius="xl"
-                size={18}
-                c={T.textGhost}
-                aria-label={`Documentation for ${node.op}`}
-                style={{ fontSize: T.fsXs, fontWeight: 600, cursor: 'help', flexShrink: 0 }}
-              >
-                ?
-              </ActionIcon>
-            </OperatorTooltip>
-          )}
+        </div>
+        <CondValueEditor
+          key={rowIdentity(node)}
+          node={node}
+          readOnly={readOnly}
+          problem={valueProblem}
+          onPatch={patchBox}
+          onTypeChange={(vt) => patch(valTypePatch(node, vt))}
+          suggestionContext={suggestionContext}
+          wide={wide}
+          dim={dim}
+        />
+        <div style={{ gridRow: 1, gridColumn: -2, display: 'flex', justifyContent: 'flex-end' }}>
           <RowMenu
             ariaLabel={`Condition options ${groupPosition(path)}`}
             disabled={readOnly}
@@ -852,66 +971,16 @@ function CondRow({
             onNegate={negate}
             onInsert={insert}
             onDuplicate={duplicate}
+            onRemove={remove}
+            valueType={
+              kind === 'box' ? undefined : { current: node.valType, onChange: (vt) => patch(valTypePatch(node, vt)) }
+            }
             onMove={move}
             canMoveUp={canMoveUp}
             canMoveDown={canMoveDown}
             rowKey={pathKey(path)}
           />
-          <Tooltip label={removeLabel} withArrow>
-            <ActionIcon
-              variant="default"
-              color="red"
-              size="sm"
-              disabled={readOnly}
-              onClick={remove}
-              aria-label={removeLabel}
-            >
-              {I.close}
-            </ActionIcon>
-          </Tooltip>
         </div>
-      </div>
-
-      <div style={{ display: 'flex', gap: T.gapXs, alignItems: 'flex-start', opacity: dim }}>
-        <Select
-          value={node.valType}
-          disabled={readOnly}
-          onChange={(value) => {
-            if (!value) return;
-            const vt = value as ValType;
-            const nextOps = FIELD_OPS[vt] ?? FIELD_OPS.string;
-            const op = (nextOps as readonly string[]).includes(node.op)
-              ? node.op
-              : (nextOps[0] ?? '$eq');
-            patch({ valType: vt, op });
-          }}
-          aria-label="Value type"
-          data={VAL_TYPES.map((vt) => ({ label: vt, value: vt }))}
-          size="xs"
-          allowDeselect={false}
-          withCheckIcon={false}
-          rightSectionWidth={20}
-          // Wide enough for OBJECTID, the longest type, once the padding is this tight.
-          style={{ width: 92, flexShrink: 0 }}
-          styles={{
-            input: {
-              paddingInlineStart: 8,
-              fontSize: T.fsXs,
-              fontWeight: 700,
-              textTransform: 'uppercase',
-              letterSpacing: 0.4,
-              color: T.textMuted,
-            },
-          }}
-        />
-        <CondValueEditor
-          key={rowIdentity(node)}
-          node={node}
-          readOnly={readOnly}
-          problem={valueProblem}
-          onPatch={patchBox}
-          suggestionContext={suggestionContext}
-        />
       </div>
 
       {showConvertToRaw && (
@@ -1970,6 +2039,7 @@ function FilterDrawer({ queryRaw, filterDraft, onCommit, suggestionContext }: Fi
   );
 
   return (
+    <WideProvider>
     <GroupView
       node={root}
       path={[]}
@@ -1984,6 +2054,7 @@ function FilterDrawer({ queryRaw, filterDraft, onCommit, suggestionContext }: Fi
       headerExtra={historyButtons}
       statusLine={statusLine}
     />
+    </WideProvider>
   );
 }
 

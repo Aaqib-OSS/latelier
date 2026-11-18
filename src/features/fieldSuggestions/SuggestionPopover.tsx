@@ -16,17 +16,6 @@ function labelFor(s: Suggestion): string {
   return s.display;
 }
 
-/**
- * The symbol and English name for an operator row (ADR 0004), as one string:
- * `> greater than`, or just `is one of` where the operator has no symbol.
- *
- * Only the query operators carry these, so a stage row is unchanged.
- */
-function nameFor(s: Suggestion): string {
-  if (s.kind !== 'operator' || !s.label) return '';
-  return s.symbol ? `${s.symbol} ${s.label}` : s.label;
-}
-
 function badgeFor(s: Suggestion): string {
   if (s.kind === 'field') return s.type ?? '';
   if (s.kind === 'operator') return CLASS_BADGE[s.class] ?? s.class;
@@ -57,6 +46,9 @@ interface Props {
    */
   groupOperators?: boolean;
 }
+
+/** Space kept between the list and the window edge. */
+const VIEWPORT_MARGIN = 8;
 
 const KEYBOARD_HINT = HINT_REGISTRY['suggestions.keyboard'];
 
@@ -89,6 +81,7 @@ export function SuggestionPopover({
   const [pos, setPos] = React.useState<{ top: number; left: number; width: number; inModal: boolean } | null>(null);
   const [panelPos, setPanelPos] = React.useState<{ top: number; left: number } | null>(null);
   const listboxRef = React.useRef<HTMLDivElement>(null);
+  const boxRef = React.useRef<HTMLDivElement>(null);
   const panelId = React.useId();
   const groupIdBase = React.useId();
   const groups = React.useMemo(
@@ -132,12 +125,19 @@ export function SuggestionPopover({
     if (!el) return;
     const update = () => {
       const r = el.getBoundingClientRect();
-      const next = {
-        top: r.bottom + 2,
-        left: r.left,
-        width: Math.max(r.width, 180),
-        inModal: el.closest('.mantine-Modal-content') !== null,
-      };
+      const inModal = el.closest('.mantine-Modal-content') !== null;
+      const width = Math.max(r.width, 180);
+      // The list opens under the input's left edge, which in a narrow panel
+      // sits so far right that the list ran off the window. Pull it back by
+      // the width it really has (measured, since it grows to its content up to
+      // the cap); the first frame has no box yet and uses the minimum. Inside
+      // a Modal the box is placed against the Modal, not the window, so that
+      // case is left to the anchor.
+      const boxWidth = boxRef.current?.offsetWidth ?? width;
+      const left = inModal
+        ? r.left
+        : Math.max(VIEWPORT_MARGIN, Math.min(r.left, window.innerWidth - boxWidth - VIEWPORT_MARGIN));
+      const next = { top: r.bottom + 2, left, width, inModal };
       setPos((prev) =>
         prev && prev.top === next.top && prev.left === next.left && prev.width === next.width && prev.inModal === next.inModal
           ? prev
@@ -243,7 +243,7 @@ export function SuggestionPopover({
 
   const renderRow = (s: Suggestion, i: number) => {
     const label = labelFor(s);
-    const name = nameFor(s);
+    const words = s.kind === 'operator' ? s.label : undefined;
     const badge = badgeFor(s);
     const active = i === highlight;
     const describedBy =
@@ -283,23 +283,38 @@ export function SuggestionPopover({
           cursor: 'pointer',
         }}
       >
-        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-          {label}
-        </span>
-        {name && (
+        {words !== undefined && (
+          // Query operators read symbol, words, name: `>=  greater than or
+          // equal to  $gte`. The symbol column is always present so the words
+          // line up whether or not the operator has one.
           <span
-            style={{
-              fontSize: T.fsXs,
-              color: T.textMuted,
-              whiteSpace: 'nowrap',
-              overflow: 'hidden',
-              textOverflow: 'ellipsis',
-              marginLeft: 'auto',
-            }}
+            data-testid="operator-symbol"
+            style={{ width: '2.4ch', flexShrink: 0, fontWeight: 600 }}
           >
-            {name}
+            {s.kind === 'operator' ? s.symbol : ''}
           </span>
         )}
+        {words !== undefined && (
+          <span
+            data-testid="operator-words"
+            style={{
+              color: T.textMuted,
+              flex: 1,
+              minWidth: 0,
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+            }}
+          >
+            {words}
+          </span>
+        )}
+        <span
+          data-testid="operator-name"
+          style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+        >
+          {label}
+        </span>
         {badge && (
           <span
             style={{
@@ -366,6 +381,7 @@ export function SuggestionPopover({
         // Same mousedown guard as the listbox: a press here must not blur
         // the input and close the popover. Presentational: the handler only
         // suppresses focus movement, this box is not itself a control.
+        ref={boxRef}
         role="presentation"
         onMouseDown={(e) => e.preventDefault()}
         style={{
@@ -373,7 +389,10 @@ export function SuggestionPopover({
           top: pos.top,
           left: pos.left,
           minWidth: pos.width,
-          maxWidth: 320,
+          // Sized by its content, not by the room left of the window edge, so
+          // the clamp above can measure it without the box shrinking as it moves.
+          width: 'max-content',
+          maxWidth: Math.min(320, window.innerWidth - 2 * VIEWPORT_MARGIN),
           background: T.surface,
           border: `1px solid ${T.borderMed}`,
           borderRadius: T.rs,
