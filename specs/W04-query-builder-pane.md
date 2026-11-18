@@ -123,7 +123,11 @@ it finds, in order:
 
 1. Op doesn't start with `$` → `'Operator must start with "$"'`.
 2. `!isCompilableOp(op)` → `'<op> is not encodable — convert to a raw clause'`.
-3. A scalar value that isn't a value of its type: `'Value must be a valid
+3. An empty value (nothing typed, or blanks only for the numeric types) on a
+   `string`, `number`, `long`, `decimal` or `regex` row, or on `$size`,
+   `$type`, `$regex` or a bit-mask operator → `'Value is empty'`; it is never
+   sent as `0` or `""`. `boolean`, `null` and `$exists` rows are never empty.
+   A scalar value that isn't a value of its type: `'Value must be a valid
    number'` (`number`), `'Long value must be an integer'` (`long`),
    `'Decimal value must be a number'` (`decimal`), or the precision message
    for a `number` beyond 2^53.
@@ -209,11 +213,112 @@ The existing Workspace's right pane is the home for this. Structure:
 
 ### Condition row layout
 
-Each `CondRow` is two lines:
+Each `CondRow` is two lines, laid out on a grid whose shape follows the row's
+type and operator and never the typed text, so typing cannot move anything:
 
-- **Line 1**: `field` input (the label, flex-fills) + `op` input (fixed width, monospace) + remove button.
-- **Line 2**: `valType` select (fixed width) + `value` input (flex-fills). The value input is hidden when `op === '$exists'`; the type select remains.
-- Row-level warning text from the §2b check renders beneath both lines.
+- **Line 1**: include checkbox, `field` input (flex-fills), `op` input (monospace, 56 px, 92 px
+  once the committed operator is longer than five characters), and the `⋮` row menu. There is no
+  delete button on a condition: *Remove* is the last item of the `⋮` menu.
+- **Line 2**: the value box, full width, its left edge on the field input's and its right edge on
+  the operator's (so the `⋮` column stays free beneath it). The value editors (text, chips for a
+  list, the date picker beside a date's text) sit inside it without a border of their own; the box
+  has the input border, the accent focus ring, and a red border when the row has a value problem.
+  It grows downward only: chips wrap onto more lines, and a long text value grows the box up to 4
+  lines.
+- **Type chip**: the value type is a small chip button at the box's right end, in sentence case
+  (`string`, `number`, `date`), named *Value type: &lt;type&gt;*. It opens a menu of the types, and
+  picking one changes the row exactly as the old select did (the operator moves to one the new
+  type offers when it must).
+- **Nothing to type**: `boolean` and `$exists` have no line 2. A two-option switch (`true | false`,
+  `present | absent`) sits on line 1 between the operator and `⋮`. `null` has no control at all.
+  Because these rows have no chip, the `⋮` menu carries a *Value type* submenu for them, so no type
+  is a dead end.
+- **Helper line**: one line under the value box, in 11 px. Several things can want it at once, so
+  only the most urgent shows: a value problem, then an Undo notice, then a type hint, then plain
+  information (`pickHelperLine`; the first listed wins among equals). The problem text is the value
+  input's accessible description. Row-level warning text from the §2b check renders beneath all of it.
+  Information is a parsed date's `ISODate("…")` form, or an ObjectId's date.
+- **Value editors**: the box follows the type and never changes the row's grid.
+  - *Text* grows with what is typed up to 4 lines, then scrolls inside the box.
+  - *ObjectId* is shown whole, never abbreviated. A valid one shows "created `<date time zone>`" as
+    its helper line, from the id's own timestamp, in the machine's time zone
+    (`2026-11-18 08:01:24 EST`). The formatter takes the time zone as an argument, so a later
+    setting can pass the person's choice; an unknown zone name throws rather than falling back. An
+    id that is not 24 hex digits shows no date.
+  - *List* (`$in`, `$nin`) is a box of chips. Typing a comma, a tab or Enter ends a chip. Pasting splits on
+    comma, newline and tab, trims every piece and drops the empty ones, so a spreadsheet column or a
+    trailing newline pastes as clean chips. Quotes are not read by the split: a chip's text is
+    interpreted afterwards as a typed chip is.
+  - *Object*: a document value is not a kind of its own. It is a raw clause (W13 §2b), whose
+    editor is capped at 6 lines, then scrolls; it is not resizable.
+- **Caps**: a list shows 3 lines of chips at rest and 8 while focused or expanded, then scrolls
+  inside the box. A list too long for the resting cap shows a footer "N values · Show all" (and
+  "Show fewer" once expanded). The footer counts chips instead of measuring them, so it may offer
+  "Show all" for a list that would have fit.
+- **Wide builder**: when the builder is at least 560 px wide (measured on the root group, not the
+  window; the panel resizes between 320 and 640 px) the value box moves up beside the operator,
+  and the field takes about 40% of what is left.
+
+### Kind changes
+
+A row's kind changes when its field names a field the sample types differently, when the type chip
+is picked, or when the operator moves between one value and a list. Nothing typed is lost: a value
+converts only when its text reads as the new kind under the printer's own rules (`printFilter`
+accepts it as that kind; a bare "12" is not a date, a date needs an ISO date start). Text is never
+rewritten, so a value converted to another kind and back is unchanged. The behaviour hangs off one
+option (`KIND_CHANGE_OPTIONS.autoConvert`, on by default) so a setting can drive it later.
+
+- **Field change**, for a single-value comparison with a sample entry for the new field:
+  - an empty box adopts the sampled type (and moves the operator if the type does not offer it), and
+    the chip flashes once;
+  - a value that reads as the sampled type converts, and the helper line says "Changed to `<type>`
+    to match `<field>`" with an *Undo* (the tree's own undo, one step);
+  - a value that does not read as it stays, and the helper line says "`<field>` is a number in
+    every sampled document" ("most sampled documents" below 100%) with a *Use number* action. With
+    `autoConvert` off a value that would convert is only offered the same way.
+  - a field with no sample entry, or a `null` row, is left alone. An empty box adopts the field's
+    type, whatever the operator.
+- **Chip change**: the value converts when it reads as the picked type, and otherwise stays and the
+  row shows its usual value problem.
+- **Operator change between `=` and `$in`**: `=` to `$in` makes the value the first chip; `$in` to
+  `=` keeps the first chip and drops the rest, and the helper line names the removed chips (three,
+  then "and N more") with *Undo*. A loaded `$in` is typed `array`; the first chip decides the row's
+  type on the way back. A value no chip can hold faithfully stays as typed and the operator changes
+  without the conversion.
+
+### A field with two types
+
+`fieldTypeSplit` turns a sampled field's type counts into a list of types, commonest first, with
+whole-percent shares that always add up to 100 (largest remainder; ties in `localeCompare` order;
+a type too rare to earn one percent is left out). A field is *mixed* when it has two or more types
+and the commonest holds under 90% of the sample, the same bar `checkFieldType` (W17) calls dominant.
+
+For a mixed field, on a single-value row:
+
+- The type chip shows the type the row sends with a two-colour dot of the two commonest types.
+- The chip menu lists the sampled types first, each with "N% of sample", then the other types.
+- When the typed value matches only part of the sample, the helper line (a type hint) says "Skips the
+  N% that store `<field>` as a number" (types joined by "or"), with a *Match either* action. When no
+  other sampled type can hold the value, it says that only values of the sent type can match,
+  and offers nothing.
+- *Match either* (`MATCH_EITHER_OPTIONS.offered`, on by default, so a setting can turn it off)
+  turns the row into `$in` with one chip per sampled type that can hold the value
+  (`["75001", 75001]`). It is offered only when both of the two commonest types can hold the value
+  as chips of their own; a number and a long match the same documents, so they are not two sides.
+  The row's chip then reads *either*.
+- A sampled type with no editor (`binary`, `timestamp`, ...) is edited as text, the chip names the
+  sampled type, and the helper line says what you type is compared as text and points to a raw
+  clause. `ValType` gains no member and persisted tab state is unchanged.
+- A field that is not in the sample gets a plain string box and no hint.
+
+### Pattern options
+- A `$regex` row shows four toggle buttons under the pattern box: `i` ignore case, `m` multiline,
+  `s` dot matches newline, `x` ignore whitespace. A lit button is a letter in the condition's
+  `options`, sent as `$options` in `imsx` order; none lit sends a bare `$regex`. The helper line
+  names the lit options. No slashes are drawn around the pattern.
+- Leaving `$regex` for another operator drops the options and says so ("Pattern options i, m were
+  removed") with Undo.
+- The Contains text (any case) starter is an empty pattern with `i` lit.
 
 ### Conditions field selector
 - On focus, the `field` input shows a field-name autocomplete popover
@@ -318,6 +423,25 @@ hand-edits to escape the flag.
   `$jsonSchema`) flag the row as "needs raw JSON"; Run is disabled.
 - *(X03)* Malformed `$mod` values (empty, single-element,
   divisor-0) are caught pre-run.
+- An empty value on a typed row is a "Value is empty" problem: red
+  value box, the field named in the status line, left out of the
+  filter.
+- A condition is two lines at a panel under 560px (field, operator,
+  `⋮`; then the value box with its type chip) and one line from 560px.
+  Typing never changes the row's shape. Boolean and `$exists` rows are a
+  switch on the first line; only a parsed date and an ObjectId's creation time have a preview line;
+  *Remove* lives in the `⋮` menu.
+- A value box has one helper line: a problem, an Undo notice, a type hint or information, the most
+  urgent only. The text box grows to 4 lines and scrolls beyond; an ObjectId shows whole with its
+  creation date in the local time zone.
+- A list pastes as chips split on comma, newline and tab with no empty chip; at rest it shows 3 lines
+  of chips and 8 while editing, with an "N values · Show all" footer when it is longer; an object
+  raw clause is capped at 6 lines, then scrolls (always, with resize off).
+- A field change converts a readable value with an Undo, keeps an unreadable one and offers the
+  sampled type, and lets an empty box adopt it. A chip change converts or keeps the text with the
+  value problem. `=` to `$in` keeps the first chip and `$in` to `=` names what it dropped, with Undo.
+- A field whose commonest type holds under 90% of the sample shows a dot on the type chip and lists
+  the sampled types with their shares; *Match either* makes the row an `$in` that matches both.
 - ** A flagged condition disables **both** Run buttons, and
   blocks the runner even when invoked with no button involved
   (`query.run`, post-write re-runs).
@@ -338,6 +462,12 @@ hand-edits to escape the flag.
   `$type`), and `isCompilableOp` and `FIELD_OPS` boundaries.
 - **filter-tree.spec.ts**: the §2b messages, through `printFilter`'s
   problems.
+- **helperLine.spec.ts**, **kindChange.spec.ts**, **fieldTypeSplit.spec.ts**, **mixedField.spec.ts**,
+  **listPaste.spec.ts**, **objectIdDate.spec.ts**: the helper line's order, `convertValue` and the
+  field and operator plans, the split's sums and tie order, the mixed hints and *Match either*
+  plan, the paste splitter, the ObjectId timestamp and the zone-argument formatter. The pure
+  helpers also have property tests (no empty chip; shares sum to 100; a value converted to a kind
+  and back is unchanged when both read it; `ObjectId.createFromTime` round-trips).
 - **parseMqlToBuilder.spec.ts**: round-trips for supported shapes;
   failures for free-form filters; recognizes `$and`, `$or`, `$date`,
   `$oid`, `$regex`.
@@ -347,4 +477,7 @@ hand-edits to escape the flag.
 - **invalid-number.spec.tsx**: typing "abc" into a number condition disables Run and shows an outlined row.
 - **projection-chips.spec.tsx**: clicking chips toggles selection; compiled projection reflects state.
 - **sort-limit.spec.tsx**: text inputs update compiled output.
+- Value editors, one test per kind and the shared frame, error and chip asserted once over every
+  kind in a table test; the list's caps and footer; the object raw clause cap; kind changes and the
+  mixed-field cases, through a stateful wrapper so each patch round-trips into props.
 - **saved-section.spec.tsx**: mock returns one saved query for collection → row visible; "Run here" hydrates state and triggers run.

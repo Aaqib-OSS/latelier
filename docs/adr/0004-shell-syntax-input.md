@@ -198,12 +198,18 @@ recording something as a boundary is not the same as scheduling it. Later built;
 now the decision rather than the note.
 
 The Query Builder's operator control is a free-text `TextInput` with a suggestion popover
-(the `opInputRef` input, `BuilderPane.tsx:423`), not a `Select` — typed text goes straight into `node.op`. The symbol layer
+(the `opInputRef` input in `CondRow`, `BuilderPane.tsx`), not a `Select` — typed text goes straight into `node.op`. The symbol layer
 is therefore: the popover *lists* symbols and English names alongside the operator; typing an exact
 symbol (`>`, `>=`, `<`, `<=`, `=`, `==`, `!=`, `<>`, and the pasted forms `≥`, `≤`, `≠`) resolves to
-the operator; and the input keeps showing `$gt`, not `>`. Keeping `$gt` in the box preserves the
-teaching value and means `node.op` always holds a real operator, so `printFilter` and
-`isCompilableOp` need no change.
+the operator; and the input keeps the symbol: the six comparisons (`$eq` `=`, `$ne` `!=`, `$gt` `>`,
+`$gte` `>=`, `$lt` `<`, `$lte` `<=`) always display as their symbol, whether it was typed as a symbol,
+typed as `$gt`, picked from the list or parsed from the Filter Bar text. Operators with no symbol keep
+their name. Only the display changes: `node.op`, the Filter Bar text, saved queries and copied code
+still hold `$gte`, so `printFilter` and `isCompilableOp` need no change, and the Filter Bar itself
+gains no symbolic dialect. Focusing the box shows the symbol as its editable text. Each row of the
+operator list reads symbol, English name and `$operator` name (`>=  greater than or equal to  $gte`),
+and the list's side panel carries the operator's documentation for the highlighted row, which is where
+operator help lives.
 
 Operators with no natural symbol get a short English `label` on `OperatorDef` — a new field, not
 the existing `summary`, which is a sentence. The label applies in query context only: an aggregation
@@ -229,7 +235,7 @@ now pins all three endings, and it is an e2e test on purpose.
 Enter carries two exclusions. The first is the popover clobber described below, reaching the same
 row by a second route: an Enter the popover already consumed is left alone, or arrowing to `$in`
 over a typed `>` lands `$gt`. The second is ⌘/Ctrl+Enter, which *runs the query* — resolving there
-would repaint the box as `$gt` while the run still used the last-committed filter, since the patch
+would repaint the box as the resolved operator while the run still used the last-committed filter, since the patch
 has not rendered. A row that still looks unfinished is the honest state, and that is the same
 truthfulness rule the stale-count work in §5 is built on.
 

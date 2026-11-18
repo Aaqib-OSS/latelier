@@ -125,10 +125,66 @@ describe('parseFilter — parse table (§2)', () => {
     );
   });
 
-  it('{ a: { $regex: "x", $options: "i" } } -> exactly one raw node', () => {
+  it('{ a: { $regex: "x", $options: "i" } } -> exactly one cond that holds the options', () => {
     const root = mustParse('{"a":{"$regex":"x","$options":"i"}}');
+    expect(root.children).toEqual([
+      cond({ field: 'a', op: '$regex', valType: 'string', value: 'x', options: 'i' }),
+    ]);
+  });
+
+  it('options come back in imsx order whatever order the clause spelled them, and print as one clause', () => {
+    const root = mustParse('{"a":{"$options":"xsi","$regex":"x"}}');
+    expect(root.children).toEqual([
+      cond({ field: 'a', op: '$regex', valType: 'string', value: 'x', options: 'isx' }),
+    ]);
+    expect(mustPrint(root)).toBe('{"a":{"$regex":"x","$options":"isx"}}');
+  });
+
+  it('empty options leave a plain $regex cond, which prints without $options', () => {
+    const root = mustParse('{"a":{"$regex":"x","$options":""}}');
+    expect(root.children).toEqual([cond({ field: 'a', op: '$regex', valType: 'string', value: 'x' })]);
+    expect(mustPrint(root)).toBe('{"a":{"$regex":"x"}}');
+  });
+
+  it.each([
+    ['an option letter MongoDB documents but a row does not model', '{"a":{"$regex":"x","$options":"u"}}'],
+    ['a repeated letter', '{"a":{"$regex":"x","$options":"ii"}}'],
+    ['an options value that is not text', '{"a":{"$regex":"x","$options":1}}'],
+    ['a pattern that is not text', '{"a":{"$regex":1,"$options":"i"}}'],
+    ['an empty pattern', '{"a":{"$regex":"","$options":"i"}}'],
+    ['a third key', '{"a":{"$regex":"x","$options":"i","$ne":"y"}}'],
+    ['$options without $regex', '{"a":{"$options":"i","$ne":"y"}}'],
+  ])('stays one raw node for %s', (_label, json) => {
+    const root = mustParse(json);
     expect(root.children).toHaveLength(1);
     expect(root.children[0].kind).toBe('raw');
+    expect(mustPrint(root)).toBe(json);
+  });
+
+  it('options on an operator other than $regex are not sent', () => {
+    const root = group('$and', [
+      cond({ field: 'a', op: '$eq', valType: 'string', value: 'x', options: 'i' }),
+    ]);
+    expect(mustPrint(root)).toBe('{"a":{"$eq":"x"}}');
+  });
+
+  it('a $regex cond with unknown option letters blocks printing and names the letters', () => {
+    const root = group('$and', [
+      cond({ field: 'a', op: '$regex', valType: 'string', value: 'x', options: 'iq' }),
+    ]);
+    const out = printFilter(root);
+    expect(out.ok).toBe(false);
+    if (!out.ok) expect(out.problems[0].message).toBe('Regex options can only be i, m, s and x');
+  });
+
+  it('toRawNode keeps the options of a $regex cond', () => {
+    const c = cond({ field: 'a', op: '$regex', valType: 'string', value: 'x', options: 'im' });
+    expect(toRawNode(c).json).toBe('{"a":{"$regex":"x","$options":"im"}}');
+  });
+
+  it('a stored tree whose options are not text is not a filter tree', () => {
+    const bad = { kind: 'group', logic: '$and', children: [{ kind: 'cond', field: 'a', op: '$regex', valType: 'string', value: 'x', options: 1 }] };
+    expect(isGroupNode(bad)).toBe(false);
   });
 
   it('{ items: { $elemMatch: {...} } } -> one raw node', () => {
@@ -310,10 +366,10 @@ describe('parseFilter — split allowlist (§2a)', () => {
     expect(root.children).toHaveLength(2);
   });
 
-  it('$regex + $options does not split — one raw node', () => {
+  it('$regex + $options does not split — one cond that carries both', () => {
     const root = mustParse('{"a":{"$regex":"x","$options":"i"}}');
     expect(root.children).toHaveLength(1);
-    expect(root.children[0].kind).toBe('raw');
+    expect(root.children[0]).toMatchObject({ kind: 'cond', op: '$regex', options: 'i' });
   });
 
   it('$near + $maxDistance does not split — one raw node', () => {
@@ -871,12 +927,12 @@ describe('condValueProblem — isScalarNumeric excludes $mod and array-value ops
     expect(printFilter(root).ok).toBe(true);
   });
 
-  it('an empty numeric value is excluded from scalar-number checks — encodes as 0 rather than blocking', () => {
+  it('an empty numeric value blocks instead of encoding as 0', () => {
     const root = group('$and', [cond({ valType: 'number', value: '' })]);
     const p = printFilter(root);
-    expect(p.ok).toBe(true);
-    if (!p.ok) return;
-    expect(JSON.parse(p.json)).toEqual({ a: { $eq: 0 } });
+    expect(p.ok).toBe(false);
+    if (p.ok) return;
+    expect(p.problems).toEqual([{ path: [0], message: 'Value is empty' }]);
   });
 });
 
@@ -1560,21 +1616,14 @@ describe('encodeCondValue — $type encodes numerically when possible, else the 
     expect(JSON.parse(p.json)).toEqual({ a: { $type: 'string' } });
   });
 
-  it('an empty $type value is excluded from the numeric branch even though Number("") is finite', () => {
+  it('an empty $type value blocks instead of printing as ""', () => {
     const p = printFilter(group('$and', [cond({ op: '$type', value: '' })]));
-    expect(p.ok).toBe(true);
-    if (!p.ok) return;
-    expect(JSON.parse(p.json)).toEqual({ a: { $type: '' } });
+    expect(p.ok).toBe(false);
   });
 
-  it('a whitespace-only $type value is excluded via trim(), not just a literal-empty check', () => {
-    // Number('   ') is 0 (finite) and '   ' !== '' is true (untrimmed) — only
-    // checking value.trim() !== '' correctly excludes this from the numeric
-    // branch, leaving the original whitespace text untouched.
+  it('a whitespace-only $type value is empty too (Number("   ") would read as 0)', () => {
     const p = printFilter(group('$and', [cond({ op: '$type', value: '   ' })]));
-    expect(p.ok).toBe(true);
-    if (!p.ok) return;
-    expect(JSON.parse(p.json)).toEqual({ a: { $type: '   ' } });
+    expect(p.ok).toBe(false);
   });
 });
 
@@ -1589,15 +1638,55 @@ describe('condValueProblem — $mod array-length guard (§3)', () => {
   });
 });
 
-describe('condValueProblem — isScalarNumeric on a genuinely empty/blank long value (§3a)', () => {
-  it('a whitespace-only long value is excluded from the integer-format check, not blocked', () => {
-    const p = printFilter(group('$and', [cond({ valType: 'long', op: '$gt', value: '   ' })]));
-    expect(p.ok).toBe(true);
+describe('condValueProblem — an empty or blank value is an error for every typed kind', () => {
+  const problemFor = (c: CondNode) => {
+    const p = printFilter(group('$and', [c]));
+    return p.ok ? null : p.problems[0].message;
+  };
+
+  it.each([
+    ['long', '   '],
+    ['long', ''],
+    ['decimal', ''],
+    ['number', ' '],
+    ['string', ''],
+    ['regex', ''],
+  ] as const)('a %s value of %j is not applied', (valType, value) => {
+    expect(problemFor(cond({ valType, op: '$gt', value }))).toBe('Value is empty');
   });
 
-  it('a fully empty long value is excluded from the integer-format check, not blocked', () => {
-    const p = printFilter(group('$and', [cond({ valType: 'long', op: '$gt', value: '' })]));
-    expect(p.ok).toBe(true);
+  it.each(['$size', '$bitsAllSet', '$regex'])('an empty %s value is not applied', (op) => {
+    expect(problemFor(cond({ valType: 'number', op, value: '' }))).toBe('Value is empty');
+  });
+
+  it('a string of blanks is a real string, not an empty one', () => {
+    expect(problemFor(cond({ valType: 'string', value: '  ' }))).toBeNull();
+  });
+
+  it('boolean, null and $exists rows have nothing to type, so are never empty', () => {
+    expect(problemFor(cond({ valType: 'boolean', value: '' }))).toBeNull();
+    expect(problemFor(cond({ valType: 'null', value: '' }))).toBeNull();
+    expect(problemFor(cond({ op: '$exists', valType: 'boolean', value: '' }))).toBeNull();
+  });
+
+  it('an empty value is left out of toRawNode, never encoded as 0', () => {
+    expect(toRawNode(cond({ valType: 'number', value: '' })).json).toBe('');
+  });
+
+  it.each([
+    ['{"name":""}'],
+    ['{"name":{"$eq":""}}'],
+    ['{"name":{"$ne":""}}'],
+    ['{"n":{"$numberLong":""}}'],
+  ])('a filter typed with an explicit empty value, %s, still round-trips', (text) => {
+    const parsed = parseFilter(text);
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.root.children[0].kind).toBe('raw');
+    const printed = printFilter(parsed.root);
+    expect(printed.ok).toBe(true);
+    if (!printed.ok) return;
+    expect(JSON.parse(printed.json)).toEqual(JSON.parse(text));
   });
 });
 

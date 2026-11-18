@@ -14,6 +14,13 @@
     "break": 90
   },
   "mutate": [
+    "src/pages/Workspace/helperLine.ts",
+    "src/pages/Workspace/kindChange.ts",
+    "src/pages/Workspace/objectIdDate.ts",
+    "src/pages/Workspace/listPaste.ts",
+    "src/pages/Workspace/fieldTypeSplit.ts",
+    "src/pages/Workspace/mixedField.ts",
+    "src/pages/Workspace/regexOptions.ts",
     "electron/mongo/ejson.ts",
     "electron/services/UndoStore.ts",
     "electron/services/UpdateService.ts",
