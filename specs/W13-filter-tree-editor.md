@@ -120,7 +120,7 @@ the most idiomatic filter there is (`{ status: "active", qty: { $gt: 5 } }`).
 | `{ $and: [...] }` / `{ $or: [...] }` / `{ $nor: [...] }` | group, recursive |
 | `{ $nor: [x] }` (exactly one item) | root `$and` holding a one-child `$nor` group: a NOT (§4), kept as a group so it reads back as one |
 | `{ a: { $gte: 1, $lte: 5 } }` | two conds — **only** per §2a |
-| `{ a: { $regex: "x", $options: "i" } }` | one **raw** node (§2a) |
+| `{ a: { $regex: "x", $options: "i" } }` | one **cond** (`op: $regex`, `options: "i"`), the one multi-key pair that is a single condition (§2a) |
 | `{ items: { $elemMatch: {...} } }` | one raw node |
 | `{ $expr: {...} }`, `{ $text: {...} }`, `{ $where: ... }`, `{ $jsonSchema: ... }` | one raw node |
 | `{ a: { $not: {...} } }` | one raw node |
@@ -148,6 +148,16 @@ const SPLITTABLE_OPS = new Set([
   '$bitsAllClear','$bitsAnyClear','$bitsAllSet','$bitsAnySet',
 ]);
 ```
+
+**One pair is a single condition.** `{ a: { $regex: "x", $options: "i" } }`
+(either key order) is one cond: `op` is `$regex`, `value` the pattern, and
+`options` the letters, held on the node rather than as a sibling cond, because
+`$options` modifies `$regex` and cannot stand alone. Only `i`, `m`, `s` and `x`
+are letters a row holds, each at most once, kept in `imsx` order; the printer
+writes `{ $regex, $options }` back in that key order (empty options print as a
+bare `$regex`). Any other shape of the pair (a letter outside those four, a
+non-text pattern or options value, an empty pattern, a third key) is still one
+raw node.
 
 `$options`, `$maxDistance`, `$minDistance`, `$elemMatch`, `$not`, `$near`,
 `$geoWithin`, `$nearSphere` are deliberately absent — each is either a modifier
@@ -264,6 +274,25 @@ consequences, all intended:
   blocking message directs the user to the `{"$numberLong": "..."}` /
   `{"$numberDecimal": "..."}` sentinel instead. Fail-closed beats silent
   rounding.
+
+### 3c. Rows the value editors make
+
+Three row shapes come from the value editors (W04 §5) rather than from typing, and all stay inside
+the representable set of §2b. The printed text round-trips (the fixpoint of §3b), though a row's
+own shape can change on the way: a row typed *string* and switched to `$in` loads back, after a
+reload, as an array row (one chip per element):
+
+- A list row is `$in`/`$nin` over the array value type, one chip per element. Pasting splits on
+  comma, newline and tab, so a pasted column and the same values typed one by one print the same
+  array. An empty chip is never made.
+- *Match either* on a mixed-type field (W04 §5, "A field with two types") rewrites a single-value
+  row to `$in` with one chip per sampled type that can hold the value, for example `{ zip: { $in:
+  ["75001", 75001] } }`. A number and a long are one side, never two. The filter bar shows that
+  text, and `parseFilter` reads it back as one `$in` row whose chips are the same string and number,
+  so editing the bar and editing the row agree. The row's chip reads *either* for such a row.
+- Moving a row between `$eq` and `$in` keeps the first chip as the single value and the other way
+  round makes the value the first chip. Chips dropped on the way back are only in the tree's undo
+  history, so the one Undo restores them.
 
 ### 3b. The round-trip guarantee
 
@@ -685,6 +714,8 @@ Retired test ids and controls, so the churn isn't a surprise:
 - `parseFilter` fails **only** on invalid JSON and on a non-object root.
 - `$oid` / `$date` / `$numberLong` / `$numberDecimal` values round-trip through cond rows preserving their exact text.
 - Each unrepresentable value shape of §2b (plain nested object, `$binary`, `$timestamp`, `$numberDouble`/`$numberInt`, `$regularExpression`, `$minKey`/`$maxKey`, `$code`, `$dbPointer`, the canonical `{$date:{$numberLong}}` date, an `$in`/`$nin`/`$all` array with an unrepresentable element) yields a raw node, never a mangled cond.
+- A list row's pasted text splits on comma, newline and tab with no empty chip. A component test holds the row in real state, pastes a list and compares the printed filter with the one made by typing the same values one by one; the two are equal.
+- *Match either* on a mixed field prints `$in` with one chip per type (`["75001", 75001]`) and `parseFilter` reads that text back as an `$in` row over the same two chips; a number and a long never make two chips.
 - `{ $or: [...], a: 1 }` parses to the root `$and` group containing the `$or` group and the cond as siblings.
 
 **Printer**
@@ -772,6 +803,7 @@ Retired test ids and controls, so the churn isn't a surprise:
 ### Component
 - **filter-tree-drawer.spec.tsx**: add / edit / remove / nest, each asserted through `queryRaw`; disable a row and a group; seeding from a matching, stale, differently-printing and blocked draft; Reset clearing the draft; negate and remove negation; insert above / below; undo / redo, coalescing and the history reset on an outside edit.
 - **filter-tree-pending.spec.tsx**: the pending-row lifecycle of §5, including a bar edit landing underneath a pending row, and switching tabs re-seeding each tab from its own state even when both tabs' text is identical (the drawer remounts on `key={tabId}`; tab A's pending row comes back from its draft).
+- **cond-value-chips.spec.tsx**, **cond-mixed-type.spec.tsx**, **cond-kind-change.spec.tsx**: the value editors of W04 §5 through a stateful wrapper, asserting the filter bar text after a paste, after *Match either* and after an `=` to `$in` change, and that the text reads back as the same row.
 - **filter-tree-raw.spec.tsx**: convert-to-raw, edit raw, try-to-parse.
 - **filter-tree-print-failure.spec.tsx**: a bad value leaves `queryRaw` untouched and surfaces the row message.
 - **saved-legacy-payload.spec.tsx**: the §8 shim — legacy payload hydrates to its original filter.

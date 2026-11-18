@@ -1394,6 +1394,8 @@ describe('Filter drawer — starter templates', () => {
     mountWith(makeState(), { sampleSchema });
 
     fireEvent.click(await screen.findByRole('button', { name: 'Contains text (any case)' }));
+    // The starter's pattern is empty, so a typed one stands for "already holds a value".
+    fireEvent.change(await screen.findByPlaceholderText('value'), { target: { value: 'ab' } });
     const field = await screen.findByPlaceholderText('field');
     fireEvent.focus(field);
     fireEvent.click(await screen.findByRole('option', { name: /qty/ }));
@@ -1448,14 +1450,14 @@ describe('Filter drawer — an empty $in list is never printed', () => {
     expect(lastWrittenQueryRaw(updateSpy)).toBeUndefined();
   });
 
-  it('switching $eq to $in over a value that is not a list leaves the filter text as it was', async () => {
+  it('switching $eq to $in makes the value the first chip and prints it as a list', async () => {
     const { updateSpy } = mountWith(makeState({ queryRaw: '{"s":{"$eq":"x"}}' }));
 
     const op = await screen.findByDisplayValue('=');
     fireEvent.change(op, { target: { value: '$in' } });
     fireEvent.blur(op);
 
-    await waitFor(() => expect(descriptionOf(screen.getByPlaceholderText('value'))).toBe(EMPTY));
-    expect(lastWrittenQueryRaw(updateSpy)).toBeUndefined();
+    await waitFor(() => expect(lastWrittenQueryRaw(updateSpy)).toBe('{"s":{"$in":["x"]}}'));
+    expect(screen.getByRole('button', { name: 'Remove x' })).toBeTruthy();
   });
 });
