@@ -5,6 +5,7 @@ import { MongoClient } from 'mongodb';
 import type { MongoMemoryServer } from 'mongodb-memory-server';
 import type { AgentAccessPool } from '../../electron/services/AgentAccessService';
 import { NotFoundError, ValidationError } from '../../electron/errors';
+import { AGENT_ACCESS_KEY } from '../../electron/ipc/prefKeys';
 import { createAgentHarness, type AgentHarness, type PoolStatus } from '../helpers/agentHarness';
 import { getSharedMongoUri } from '../helpers/mongo';
 import { startMongoMemoryServer } from '../helpers/startMongoMemoryServer';
@@ -76,6 +77,7 @@ describe('the share-time privilege check against real servers', () => {
 
   it('shows a read-only user as such, and shares on Share', async () => {
     const { h, pool, id } = setup();
+    await h.enable();
     pool.clients.set(id, await asUser('ro'));
     h.answers.push(SHARE);
 
@@ -245,6 +247,89 @@ describe('the share-time privilege check against real servers', () => {
     await h.svc.requestSetShared(id, true);
     h.connRepo.setShared(id, false);
     expect(h.svc.getState().privilege).toEqual({});
+  });
+
+  describe('while Agent Access is off', () => {
+    it('asks once to turn it on and share, and does both on confirm', async () => {
+      const { h, pool, id } = setup();
+      pool.clients.set(id, await asUser('ro'));
+      h.answers.push(SHARE);
+
+      const out = await h.svc.requestSetShared(id, true);
+
+      expect(h.boxes).toHaveLength(1);
+      const box = h.boxes[0]!;
+      expect(box.buttons).toEqual(['Cancel', 'Turn on and share']);
+      expect(box.title).toBe('Turn on Agent Access and share?');
+      expect(box.message).toContain('"prod"');
+      expect(box.detail).toContain('This user can only read.');
+      expect(box.detail).toContain('They cannot write or delete anything');
+      expect(out.shared).toBe(true);
+      expect(isShared(h, id)).toBe(true);
+      expect(h.svc.getState().enabled).toBe(true);
+      expect(h.svc.getState().socketPath).not.toBe('');
+    });
+
+    it('changes neither the switch nor the flag on cancel', async () => {
+      const { h, pool, id } = setup();
+      pool.clients.set(id, await asUser('ro'));
+      h.answers.push(0);
+
+      const out = await h.svc.requestSetShared(id, true);
+
+      expect(out.shared).toBe(false);
+      expect(isShared(h, id)).toBe(false);
+      expect(h.svc.getState().enabled).toBe(false);
+    });
+
+    it('asks to open a closed Connection before it asks to turn anything on', async () => {
+      const { h, pool, id } = setup();
+      pool.statuses.set(id, 'disconnected');
+
+      await h.svc.requestSetShared(id, true);
+
+      expect(h.boxes.map((b) => b.title)).toEqual(['Open this Connection first']);
+      expect(h.svc.getState().enabled).toBe(false);
+    });
+
+    it('leaves Agent Access off when the Connection changed while the question was open', async () => {
+      const { h, pool, id } = setup();
+      pool.clients.set(id, await asUser('ro'));
+      h.answers.push(SHARE);
+      h.onBox = () => {
+        h.tmp.db.prepare("UPDATE connections SET host = 'elsewhere' WHERE id = ?").run(id);
+      };
+
+      await expect(h.svc.requestSetShared(id, true)).rejects.toThrow(/changed while the question was open/);
+      expect(isShared(h, id)).toBe(false);
+      expect(h.svc.getState().enabled).toBe(false);
+    });
+
+    it('checks again after Agent Access starts, and turns it back off when the Connection changed during startup', async () => {
+      const { h, pool, id } = setup();
+      pool.clients.set(id, await asUser('ro'));
+      h.answers.push(SHARE);
+      // The edit lands while the server is starting: after the first check, before the write.
+      h.appState.subscribe<boolean>(AGENT_ACCESS_KEY, (on) => {
+        if (on) h.tmp.db.prepare("UPDATE connections SET host = 'elsewhere' WHERE id = ?").run(id);
+      });
+
+      await expect(h.svc.requestSetShared(id, true)).rejects.toThrow(/changed while the question was open/);
+      expect(isShared(h, id)).toBe(false);
+      expect(h.svc.getState().enabled).toBe(false);
+      expect(h.svc.getState().socketPath).toBe('');
+    });
+
+    it('shows only the share question once Agent Access is on', async () => {
+      const { h, pool, id } = setup();
+      await h.enable();
+      pool.clients.set(id, await asUser('ro'));
+      h.answers.push(SHARE);
+
+      await h.svc.requestSetShared(id, true);
+
+      expect(h.boxes.map((b) => b.title)).toEqual(['Share with Agents?']);
+    });
   });
 
   it('pushes the new state when the flag changes', async () => {
