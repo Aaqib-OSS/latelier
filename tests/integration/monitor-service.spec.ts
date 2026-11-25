@@ -92,6 +92,10 @@ describe('MonitorService', () => {
         .collection('sleepy')
         .find({ $where: 'sleep(20000) || true' })
         .toArray();
+      const runningError = running.then(
+        () => undefined,
+        (error: unknown) => error,
+      );
       let target: string | undefined;
       for (let i = 0; i < 50 && !target; i++) {
         const { ops } = await svc.currentOp({ connectionId: 'rw', activeOnly: true });
@@ -100,7 +104,7 @@ describe('MonitorService', () => {
       }
       expect(target).toBeDefined();
       await svc.killOp({ connectionId: 'rw', opid: target! });
-      await expect(running).rejects.toMatchObject({ codeName: 'Interrupted' });
+      expect(await runningError).toMatchObject({ codeName: 'Interrupted' });
     } finally {
       await outside.close();
     }
@@ -118,6 +122,10 @@ describe('MonitorService', () => {
       .collection('hog')
       .find({ $where: 'sleep(4000) || true' })
       .toArray();
+    const runningError = running.then(
+      () => undefined,
+      (error: unknown) => error,
+    );
     let target: string | undefined;
     for (let i = 0; i < 20 && !target; i++) {
       const { ops } = await svc.currentOp({ connectionId: 'one', activeOnly: true });
@@ -126,7 +134,7 @@ describe('MonitorService', () => {
     }
     expect(target).toBeDefined();
     await svc.killOp({ connectionId: 'one', opid: target! });
-    await expect(running).rejects.toMatchObject({ codeName: 'Interrupted' });
+    expect(await runningError).toMatchObject({ codeName: 'Interrupted' });
   }, 20_000);
 
   it('asks $currentOp to leave idle sessions out, which carry no opid', async () => {
