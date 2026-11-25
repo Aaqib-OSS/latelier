@@ -74,7 +74,7 @@ test('restores the same Focused Tab, runs it and focuses its filter, across a qu
           });
         } catch (error) {
           const details = error instanceof Error ? error.message : JSON.stringify(error);
-          throw new Error(`Failed to seed focused-tab restore fixture: ${details}`);
+          throw new Error(`Failed to seed focused-tab restore fixture: ${details}`, { cause: error });
         }
       }, baseConnInput(host, port));
 
