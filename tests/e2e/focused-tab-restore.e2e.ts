@@ -35,6 +35,7 @@ test('restores the same Focused Tab, runs it and focuses its filter, across a qu
         const api = (window as unknown as {
           atelier: {
             conn: { create: (i: unknown) => Promise<{ id: string }> };
+            mongo: { connect: (id: string) => Promise<{ status: string }> };
             tabs: {
               openCollection: (i: {
                 connectionId: string;
@@ -45,27 +46,36 @@ test('restores the same Focused Tab, runs it and focuses its filter, across a qu
             };
           };
         }).atelier;
-        const c = await api.conn.create(input);
-        await api.tabs.openCollection({ connectionId: c.id, dbName: 'db', collection: 'alpha' });
-        const beta = await api.tabs.openCollection({
-          connectionId: c.id,
-          dbName: 'db',
-          collection: 'beta',
-        });
-        // `beta` is second in the strip and is the Focused Tab.
-        await api.tabs.setActive(beta.id);
-        await (
-          window as unknown as {
-            atelier: {
-              doc: { insert: (i: unknown) => Promise<unknown> };
-            };
+        try {
+          const c = await api.conn.create(input);
+          const connected = await api.mongo.connect(c.id);
+          if (connected.status !== 'connected') {
+            throw new Error(`MongoDB connection did not become connected: ${connected.status}`);
           }
-        ).atelier.doc.insert({
-          connectionId: c.id,
-          dbName: 'db',
-          collection: 'beta',
-          docJson: JSON.stringify({ marker: 'focused-tab-restore-run' }),
-        });
+          await api.tabs.openCollection({ connectionId: c.id, dbName: 'db', collection: 'alpha' });
+          const beta = await api.tabs.openCollection({
+            connectionId: c.id,
+            dbName: 'db',
+            collection: 'beta',
+          });
+          // `beta` is second in the strip and is the Focused Tab.
+          await api.tabs.setActive(beta.id);
+          await (
+            window as unknown as {
+              atelier: {
+                doc: { insert: (i: unknown) => Promise<unknown> };
+              };
+            }
+          ).atelier.doc.insert({
+            connectionId: c.id,
+            dbName: 'db',
+            collection: 'beta',
+            docJson: JSON.stringify({ marker: 'focused-tab-restore-run' }),
+          });
+        } catch (error) {
+          const details = error instanceof Error ? error.message : JSON.stringify(error);
+          throw new Error(`Failed to seed focused-tab restore fixture: ${details}`, { cause: error });
+        }
       }, baseConnInput(host, port));
 
       // Reload so the freshly-mounted Workspace reads the persisted tabs the
